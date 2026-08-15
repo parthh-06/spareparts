@@ -1,0 +1,4 @@
+SparePartsApp/runtime/lib/modules filter=lfs diff=lfs merge=lfs -text
+add filter=lfs diff=lfs merge=lfs -text
+SpareP filter=lfs diff=lfs merge=lfs -text
+SparePartsApp/runtime/lib/modulesgit filter=lfs diff=lfs merge=lfs -text
