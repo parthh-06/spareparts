@@ -27,9 +27,11 @@ private object AppColors {
     val Bg = Color(0xFF2E2E2E)
     val Card = Color(0xFF3A3A3A)
     val Gold = Color(0xFFD5C875)
+    val Teal = Color(0xFF5AC8FA)
+    val Orange = Color(0xFFFF9F0A)
     val Dark = Color(0xFF353535)
     val Green = Color(0xFF1C4A1E)
-    val Red = Color(0xFF760E03)
+    val Red = Color(0xFFFF453A)
     val Navy = Color(0xFF23204B)
 }
 
@@ -750,7 +752,7 @@ fun insuranceScreen(onBack: () -> Unit) {
     Row(verticalAlignment = Alignment.CenterVertically) {
         Button(onClick = onBack, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Dark), modifier = Modifier.size(44.dp)) { Text("←", color = Color.White, fontSize = 18.sp) }
         Spacer(Modifier.width(12.dp)); Text(title, fontFamily = girassol, color = AppColors.Gold, fontSize = 28.sp, modifier = Modifier.weight(1f))
-        Button(onClick = onAdd, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Green), shape = RoundedCornerShape(8.dp)) { Text("+ Add", color = Color.White, fontWeight = FontWeight.Bold) }
+        Button(onClick = onAdd, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Gold), shape = RoundedCornerShape(8.dp)) { Text("+ Add", color = AppColors.Bg, fontWeight = FontWeight.Bold) }
     }
 }
 @Composable private fun SearchBar(q: String, o: (String) -> Unit, h: String) {
@@ -763,5 +765,14 @@ fun insuranceScreen(onBack: () -> Unit) {
     Card(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp), backgroundColor = AppColors.Card, shape = RoundedCornerShape(8.dp), elevation = 3.dp, content = c)
 }
 @Composable private fun Btn(t: String, c: Color, a: () -> Unit) {
-    Button(onClick = a, colors = ButtonDefaults.buttonColors(backgroundColor = c), shape = RoundedCornerShape(6.dp), modifier = Modifier.height(30.dp)) { Text(t, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold) }
+    val bg: Color
+    val txt: Color
+    val borderColor: Color
+    when (c) {
+        AppColors.Green -> { bg = AppColors.Teal; txt = AppColors.Bg; borderColor = Color.Transparent } // View - teal #00B4FF + bg
+        AppColors.Navy -> { bg = AppColors.Orange; txt = AppColors.Bg; borderColor = Color.Transparent } // Edit - orange #FF6B00 + bg
+        AppColors.Red -> { bg = AppColors.Red; txt = Color.White; borderColor = Color.Transparent } // Del - solid red+white, no border
+        else -> { bg = AppColors.Teal; txt = AppColors.Bg; borderColor = Color.Transparent }
+    }
+    Button(onClick = a, colors = ButtonDefaults.buttonColors(backgroundColor = bg), shape = RoundedCornerShape(6.dp), modifier = Modifier.height(30.dp).border(0.5.dp, borderColor, RoundedCornerShape(6.dp))) { Text(t, color = txt, fontSize = 11.sp, fontWeight = FontWeight.Bold) }
 }
