@@ -12,7 +12,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.platform.Font
 import androidx.compose.ui.unit.sp
-import java.sql.Connection
 import java.sql.DriverManager
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.rememberScrollState
@@ -23,6 +22,28 @@ import androidx.compose.ui.text.font.FontWeight
 val girassol = FontFamily(Font("fonts/girassol.ttf"))
 private const val DB_USER = "root"
 private const val DB_PASS = "root"
+
+private object AppColors {
+    val Bg = Color(0xFF2E2E2E)
+    val Card = Color(0xFF3A3A3A)
+    val Gold = Color(0xFFD5C875)
+    val Dark = Color(0xFF353535)
+    val Green = Color(0xFF1C4A1E)
+    val Red = Color(0xFF760E03)
+    val Navy = Color(0xFF23204B)
+}
+
+private inline fun <T> withDb(db: String, block: (java.sql.Connection) -> T): T =
+    DriverManager.getConnection("jdbc:mysql://localhost:3306/$db", DB_USER, DB_PASS).use(block)
+
+@Composable
+private fun RowScope.HeaderCell(text: String, weight: Float) {
+    Text(text, Modifier.weight(weight), AppColors.Gold, fontWeight = FontWeight.Bold)
+}
+
+private fun togglePaid(db: String, sql: String, id: Int, onSuccess: () -> Unit) {
+    try { withDb(db) { c -> c.prepareStatement(sql).apply { setInt(1, id) }.executeUpdate() }; onSuccess() } catch (_: Exception) { }
+}
 
 data class CustomerRow(val customerId: Int, val name: String, val phone: String, val billId: Int, val billDate: String, val paid: Boolean, val itemName: String, val quantity: Int, val price: Double)
 data class SupplierRow(val supplierId: Int, val name: String, val phone: String, val receiptId: Int, val receiptDate: String, val paid: Boolean, val productName: String, val quantity: Int, val costPrice: Double)
@@ -48,7 +69,7 @@ fun App() {
 
 @Composable
 fun HomeScreen(onNavigate: (String) -> Unit) {
-    Column(Modifier.fillMaxSize().background(Color(0xFF2E2E2E)).padding(20.dp), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
+    Column(Modifier.fillMaxSize().background(AppColors.Bg).padding(20.dp), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
         Text("WELCOME", fontFamily = girassol, color = Color(0x99FFFFFFA), fontSize = 50.sp)
 
         Spacer(Modifier.height(30.dp))
@@ -58,7 +79,7 @@ fun HomeScreen(onNavigate: (String) -> Unit) {
         Row { HomeBtn("PRODUCT") { onNavigate("product") }; Spacer(Modifier.width(20.dp)); HomeBtn("INSURANCE") { onNavigate("insurance") } }
     }
 }
-@Composable private fun HomeBtn(t: String, c: () -> Unit) = Button(onClick = c, modifier = Modifier.size(250.dp, 132.dp).border(1.dp, Color(0xFFD5C875)), colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF353535))) { Text(t, fontFamily = girassol, fontSize = 24.sp, color = Color.White) }
+@Composable private fun HomeBtn(t: String, c: () -> Unit) = Button(onClick = c, modifier = Modifier.size(250.dp, 132.dp).border(1.dp, AppColors.Gold), colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Dark)) { Text(t, fontFamily = girassol, fontSize = 24.sp, color = Color.White) }
 
 @Composable
 fun CustomerScreen(onBack: () -> Unit) {
@@ -72,27 +93,28 @@ fun CustomerScreen(onBack: () -> Unit) {
     val allRows = remember(refresh) {
         val list = mutableListOf<CustomerRow>()
         try {
-            val c = DriverManager.getConnection("jdbc:mysql://localhost:3306/customers", DB_USER, DB_PASS)
-            val r = c.createStatement().executeQuery("""
-                SELECT c.id, c.name, c.phone, b.bill_id, b.bill_date, b.paid, bi.item_name, bi.quantity, bi.price
-                FROM customer c JOIN bills b ON c.id = b.customer_id JOIN bill_items bi ON b.bill_id = bi.bill_id
-                ORDER BY b.bill_date DESC
-            """.trimIndent())
-            while (r.next()) list.add(CustomerRow(r.getInt("id"), r.getString("name"), r.getString("phone"), r.getInt("bill_id"), r.getString("bill_date"), r.getBoolean("paid"), r.getString("item_name"), r.getInt("quantity"), r.getDouble("price")))
-            c.close(); errorMsg = ""
+            withDb("customers") { c ->
+                val r = c.createStatement().executeQuery("""
+                    SELECT c.id, c.name, c.phone, b.bill_id, b.bill_date, b.paid, bi.item_name, bi.quantity, bi.price
+                    FROM customer c JOIN bills b ON c.id = b.customer_id JOIN bill_items bi ON b.bill_id = bi.bill_id
+                    ORDER BY b.bill_date DESC
+                """.trimIndent())
+                while (r.next()) list.add(CustomerRow(r.getInt("id"), r.getString("name"), r.getString("phone"), r.getInt("bill_id"), r.getString("bill_date"), r.getBoolean("paid"), r.getString("item_name"), r.getInt("quantity"), r.getDouble("price")))
+            }
+            errorMsg = ""
         } catch (e: Exception) { errorMsg = e.message ?: "Error" }
         list
     }
     val filtered = if (search.isBlank()) allRows else allRows.filter { it.name.contains(search, ignoreCase = true) || it.phone.contains(search) }
     val grouped = filtered.groupBy { it.name }
 
-    Box(Modifier.fillMaxSize().background(Color(0xFF2E2E2E))) {
+    Box(Modifier.fillMaxSize().background(AppColors.Bg)) {
         Column(Modifier.fillMaxSize().padding(20.dp)) {
             ScreenHeader("CUSTOMERS", onBack) { showAdd = true }
             Spacer(Modifier.height(8.dp)); SearchBar(search, { search = it }, "Search customers...")
             if (errorMsg.isNotBlank()) ErrorCard(errorMsg)
             Spacer(Modifier.height(8.dp))
-            Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) { Text("Name", Modifier.weight(2f), Color(0xFFD5C875), fontWeight = FontWeight.Bold); Text("Phone", Modifier.weight(2f), Color(0xFFD5C875), fontWeight = FontWeight.Bold); Text("Actions", Modifier.weight(2.5f), Color(0xFFD5C875), fontWeight = FontWeight.Bold) }
+            Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) { HeaderCell("Name", 2f); HeaderCell("Phone", 2f); HeaderCell("Actions", 2.5f) }
             Divider(color = Color.Gray, thickness = 1.dp)
             Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(top = 6.dp)) {
                 grouped.forEach { (name, rows) ->
@@ -102,11 +124,11 @@ fun CustomerScreen(onBack: () -> Unit) {
                             Text(name, Modifier.weight(2f), color = Color.White, fontSize = 15.sp)
                             Text(phone, Modifier.weight(2f), color = Color.LightGray, fontSize = 14.sp)
                             Row(Modifier.weight(2.5f), horizontalArrangement = Arrangement.End) {
-                                Btn("Bills", Color(0xFFD5C875)) { selectedCustomer = name }
+                                Btn("Bills", AppColors.Gold) { selectedCustomer = name }
                                 Spacer(Modifier.width(4.dp))
-                                Btn("Edit", Color(0xFF23204B)) { editingCustomer = rows.first() }
+                                Btn("Edit", AppColors.Navy) { editingCustomer = rows.first() }
                                 Spacer(Modifier.width(4.dp))
-                                Btn("Del", Color(0xFF760E03)) { deletingCustomer = rows.first() }
+                                Btn("Del", AppColors.Red) { deletingCustomer = rows.first() }
                             }
                         }
                     }
@@ -126,11 +148,8 @@ fun CustomerScreen(onBack: () -> Unit) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text("Bill #$bid — ${bs.first().billDate.take(10)}", fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.weight(1f))
                                 Button(onClick = {
-                                    try {
-                                        val c = DriverManager.getConnection("jdbc:mysql://localhost:3306/customers", DB_USER, DB_PASS)
-                                        val p = c.prepareStatement("UPDATE bills SET paid = NOT paid WHERE bill_id = ?"); p.setInt(1, bid); p.executeUpdate(); c.close(); refresh++
-                                    } catch (_: Exception) { selectedCustomer = null }
-                                }, colors = ButtonDefaults.buttonColors(backgroundColor = if (pd) Color(0xFF1C4A1E) else Color(0xFF9E9E9E)), shape = RoundedCornerShape(4.dp), modifier = Modifier.height(26.dp)) { Text(if (pd) "Paid" else "Unpaid", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold) }
+                                    try { withDb("customers") { c -> c.prepareStatement("UPDATE bills SET paid = NOT paid WHERE bill_id = ?").apply { setInt(1, bid) }.executeUpdate() }; refresh++ } catch (_: Exception) { selectedCustomer = null }
+                                }, colors = ButtonDefaults.buttonColors(backgroundColor = if (pd) AppColors.Green else Color(0xFF9E9E9E)), shape = RoundedCornerShape(4.dp), modifier = Modifier.height(26.dp)) { Text(if (pd) "Paid" else "Unpaid", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold) }
                             }
                             Divider(color = Color.Gray, thickness = 1.dp, modifier = Modifier.padding(vertical = 4.dp))
                             bs.forEach { itm -> Row(Modifier.fillMaxWidth()) { Text(itm.itemName, Modifier.weight(2f), fontSize = 13.sp); Text("x${itm.quantity}", Modifier.weight(1f), fontSize = 13.sp); Text("₹${itm.price}", Modifier.weight(1f), fontSize = 13.sp); Text("₹${itm.quantity * itm.price}", Modifier.weight(1f), fontSize = 13.sp, fontWeight = FontWeight.Bold) } }
@@ -140,7 +159,7 @@ fun CustomerScreen(onBack: () -> Unit) {
                     }
                 }
             }
-        }, confirmButton = { Button(onClick = { selectedCustomer = null }, colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF353535))) { Text("Close", color = Color.White) } }, shape = RoundedCornerShape(12.dp))
+        }, confirmButton = { Button(onClick = { selectedCustomer = null }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Dark)) { Text("Close", color = Color.White) } }, shape = RoundedCornerShape(12.dp))
     }
 
     if (showAdd) AddCustomerBillDialog(refresh = { refresh++ }) { showAdd = false }
@@ -154,10 +173,8 @@ fun CustomerScreen(onBack: () -> Unit) {
             }
         }, confirmButton = {
             Button(onClick = {
-                try { val c = DriverManager.getConnection("jdbc:mysql://localhost:3306/customers", DB_USER, DB_PASS)
-                    val p = c.prepareStatement("UPDATE customer SET name=?, phone=? WHERE id=?"); p.setString(1, nm); p.setString(2, ph); p.setInt(3, cust.customerId); p.executeUpdate(); c.close(); refresh++; editingCustomer = null
-                } catch (e: Exception) { errorMsg = e.message ?: "Update failed" }
-            }, colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF353535))) { Text("Update", color = Color.White) }
+                try { withDb("customers") { c -> c.prepareStatement("UPDATE customer SET name=?, phone=? WHERE id=?").apply { setString(1, nm); setString(2, ph); setInt(3, cust.customerId) }.executeUpdate() }; refresh++; editingCustomer = null } catch (e: Exception) { errorMsg = e.message ?: "Update failed" }
+            }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Dark)) { Text("Update", color = Color.White) }
         }, dismissButton = { TextButton(onClick = { editingCustomer = null }) { Text("Cancel") } }, shape = RoundedCornerShape(12.dp))
     }
 
@@ -165,10 +182,8 @@ fun CustomerScreen(onBack: () -> Unit) {
         AlertDialog(onDismissRequest = { deletingCustomer = null }, title = { Text("Delete Customer", fontFamily = girassol) }, text = { Text("Delete ${cust.name} and all their bills?") },
             confirmButton = {
                 Button(onClick = {
-                    try { val c = DriverManager.getConnection("jdbc:mysql://localhost:3306/customers", DB_USER, DB_PASS)
-                        c.prepareStatement("DELETE FROM customer WHERE id=?").apply { setInt(1, cust.customerId) }.executeUpdate(); c.close(); refresh++; deletingCustomer = null
-                    } catch (e: Exception) { errorMsg = e.message ?: "Delete failed" }
-                }, colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF760E03))) { Text("Delete", color = Color.White) }
+                    try { withDb("customers") { c -> c.prepareStatement("DELETE FROM customer WHERE id=?").apply { setInt(1, cust.customerId) }.executeUpdate() }; refresh++; deletingCustomer = null } catch (e: Exception) { errorMsg = e.message ?: "Delete failed" }
+                }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Red)) { Text("Delete", color = Color.White) }
             }, dismissButton = { TextButton(onClick = { deletingCustomer = null }) { Text("Cancel") } }, shape = RoundedCornerShape(12.dp))
     }
 }
@@ -182,11 +197,12 @@ private fun AddCustomerBillDialog(refresh: () -> Unit, onClose: () -> Unit) {
 
     LaunchedEffect(Unit) {
         try {
-            val c = DriverManager.getConnection("jdbc:mysql://localhost:3306/stock", DB_USER, DB_PASS)
-            val r = c.createStatement().executeQuery("SELECT id, product_name, selling_price FROM products ORDER BY product_name")
-            val l = mutableListOf<ProductRow>()
-            while (r.next()) l.add(ProductRow(r.getInt("id"), r.getString("product_name"), "", 0, "", "", 0, 0.0, r.getDouble("selling_price")))
-            c.close(); prodList = l
+            withDb("stock") { c ->
+                val r = c.createStatement().executeQuery("SELECT id, product_name, selling_price FROM products ORDER BY product_name")
+                val l = mutableListOf<ProductRow>()
+                while (r.next()) l.add(ProductRow(r.getInt("id"), r.getString("product_name"), "", 0, "", "", 0, 0.0, r.getDouble("selling_price")))
+                prodList = l
+            }
         } catch (e: Exception) { msg = "Failed to load products: ${e.message}" }
     }
 
@@ -223,7 +239,7 @@ private fun AddCustomerBillDialog(refresh: () -> Unit, onClose: () -> Unit) {
                         if (matches.isNotEmpty()) {
                             Text("Suggestions:", fontSize = 11.sp, color = Color.Gray)
                             matches.take(5).forEach { m ->
-                                Text("${m.productName} (₹${m.sellingPrice})", fontSize = 12.sp, color = Color(0xFF23204B), modifier = Modifier.clickable { prodName = m.productName; itemPrice = m.sellingPrice.toString(); itemQty = "1" })
+                                Text("${m.productName} (₹${m.sellingPrice})", fontSize = 12.sp, color = AppColors.Navy, modifier = Modifier.clickable { prodName = m.productName; itemPrice = m.sellingPrice.toString(); itemQty = "1" })
                             }
                         }
                     }
@@ -234,7 +250,7 @@ private fun AddCustomerBillDialog(refresh: () -> Unit, onClose: () -> Unit) {
                             lineItems.add(LineItem(match.id, match.productName, itemQty.toInt(), itemPrice.toDouble()))
                             prodName = ""; itemQty = "1"; itemPrice = match.sellingPrice.toString()
                         }
-                    }, colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF23204B))) { Text("+ Add Item", color = Color.White, fontSize = 13.sp) }
+                    }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Navy)) { Text("+ Add Item", color = Color.White, fontSize = 13.sp) }
                     if (lineItems.isNotEmpty()) {
                         Spacer(Modifier.height(8.dp)); Divider(color = Color.Gray, thickness = 1.dp); Spacer(Modifier.height(4.dp))
                         Text("Items (${lineItems.size}):", fontWeight = FontWeight.Bold, fontSize = 13.sp)
@@ -255,7 +271,7 @@ private fun AddCustomerBillDialog(refresh: () -> Unit, onClose: () -> Unit) {
                     else { msg = "Not found"; step = 1 }
                     c.close()
                 } catch (e: Exception) { msg = e.message ?: "Error" }
-            }, colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF353535))) { Text("Check", color = Color.White) }
+            }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Dark)) { Text("Check", color = Color.White) }
             1 -> Button(onClick = {
                 if (ph.isBlank()) return@Button
                 try {
@@ -264,7 +280,7 @@ private fun AddCustomerBillDialog(refresh: () -> Unit, onClose: () -> Unit) {
                     p.setString(1, nm); p.setString(2, ph); p.executeUpdate()
                     val r = p.generatedKeys; r.next(); foundId = r.getInt(1); c.close(); step = 2
                 } catch (e: Exception) { msg = e.message ?: "Error" }
-            }, colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF1C4A1E))) { Text("Create & Continue", color = Color.White) }
+            }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Green)) { Text("Create & Continue", color = Color.White) }
             2 -> Button(enabled = lineItems.isNotEmpty(), onClick = {
                 try {
                     val c = DriverManager.getConnection("jdbc:mysql://localhost:3306/customers", DB_USER, DB_PASS)
@@ -285,7 +301,7 @@ private fun AddCustomerBillDialog(refresh: () -> Unit, onClose: () -> Unit) {
                     } finally { c.autoCommit = true; c.close() }
                     onClose()
                 } catch (e: Exception) { msg = e.message ?: "Error" }
-            }, colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF1C4A1E))) { Text("Save Bill (₹${lineItems.sumOf { it.qty * it.price }})", color = Color.White) }
+            }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Green)) { Text("Save Bill (₹${lineItems.sumOf { it.qty * it.price }})", color = Color.White) }
         }
     }, dismissButton = { TextButton(onClick = onClose) { Text("Cancel") } }, shape = RoundedCornerShape(12.dp))
 }
@@ -302,27 +318,28 @@ fun SupplierScreen(onBack: () -> Unit) {
     val allRows = remember(refresh) {
         val list = mutableListOf<SupplierRow>()
         try {
-            val c = DriverManager.getConnection("jdbc:mysql://localhost:3306/suppliers", DB_USER, DB_PASS)
-            val r = c.createStatement().executeQuery("""
-                SELECT s.id, s.name, s.phone, r.id AS receipt_id, r.receipt_date, r.paid, p.product_name, ri.quantity, ri.cost_price
-                FROM supplier s JOIN supplier_receipts r ON s.id = r.supplier_id JOIN supplier_receipt_items ri ON r.id = ri.receipt_id
-                JOIN stock.products p ON ri.stock_id = p.id ORDER BY r.receipt_date DESC
-            """.trimIndent())
-            while (r.next()) list.add(SupplierRow(r.getInt("id"), r.getString("name"), r.getString("phone"), r.getInt("receipt_id"), r.getString("receipt_date"), r.getBoolean("paid"), r.getString("product_name"), r.getInt("quantity"), r.getDouble("cost_price")))
-            c.close(); errorMsg = ""
+            withDb("suppliers") { c ->
+                val r = c.createStatement().executeQuery("""
+                    SELECT s.id, s.name, s.phone, r.id AS receipt_id, r.receipt_date, r.paid, p.product_name, ri.quantity, ri.cost_price
+                    FROM supplier s JOIN supplier_receipts r ON s.id = r.supplier_id JOIN supplier_receipt_items ri ON r.id = ri.receipt_id
+                    JOIN stock.products p ON ri.stock_id = p.id ORDER BY r.receipt_date DESC
+                """.trimIndent())
+                while (r.next()) list.add(SupplierRow(r.getInt("id"), r.getString("name"), r.getString("phone"), r.getInt("receipt_id"), r.getString("receipt_date"), r.getBoolean("paid"), r.getString("product_name"), r.getInt("quantity"), r.getDouble("cost_price")))
+            }
+            errorMsg = ""
         } catch (e: Exception) { errorMsg = e.message ?: "Error" }
         list
     }
     val filtered = if (search.isBlank()) allRows else allRows.filter { it.name.contains(search, ignoreCase = true) || it.phone.contains(search) }
     val grouped = filtered.groupBy { it.name }
 
-    Box(Modifier.fillMaxSize().background(Color(0xFF2E2E2E))) {
+    Box(Modifier.fillMaxSize().background(AppColors.Bg)) {
         Column(Modifier.fillMaxSize().padding(20.dp)) {
             ScreenHeader("SUPPLIERS", onBack) { showAdd = true }
             Spacer(Modifier.height(8.dp)); SearchBar(search, { search = it }, "Search suppliers...")
             if (errorMsg.isNotBlank()) ErrorCard(errorMsg)
             Spacer(Modifier.height(8.dp))
-            Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) { Text("Name", Modifier.weight(2f), Color(0xFFD5C875), fontWeight = FontWeight.Bold); Text("Phone", Modifier.weight(2f), Color(0xFFD5C875), fontWeight = FontWeight.Bold); Text("Actions", Modifier.weight(2.5f), Color(0xFFD5C875), fontWeight = FontWeight.Bold) }
+            Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) { HeaderCell("Name", 2f); HeaderCell("Phone", 2f); HeaderCell("Actions", 2.5f) }
             Divider(color = Color.Gray, thickness = 1.dp)
             Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(top = 6.dp)) {
                 grouped.forEach { (name, rows) ->
@@ -332,11 +349,11 @@ fun SupplierScreen(onBack: () -> Unit) {
                             Text(name, Modifier.weight(2f), color = Color.White, fontSize = 15.sp)
                             Text(phone, Modifier.weight(2f), color = Color.LightGray, fontSize = 14.sp)
                             Row(Modifier.weight(2.5f), horizontalArrangement = Arrangement.End) {
-                                Btn("View", Color(0xFF1C4A1E)) { selectedSupplier = name }
+                                Btn("View", AppColors.Green) { selectedSupplier = name }
                                 Spacer(Modifier.width(4.dp))
-                                Btn("Edit", Color(0xFF23204B)) { editingSupplier = rows.first() }
+                                Btn("Edit", AppColors.Navy) { editingSupplier = rows.first() }
                                 Spacer(Modifier.width(4.dp))
-                                Btn("Del", Color(0xFF760E03)) { deletingSupplier = rows.first() }
+                                Btn("Del", AppColors.Red) { deletingSupplier = rows.first() }
                             }
                         }
                     }
@@ -356,11 +373,8 @@ fun SupplierScreen(onBack: () -> Unit) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text("Receipt #$rid — ${rs.first().receiptDate.take(10)}", fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.weight(1f))
                                 Button(onClick = {
-                                    try {
-                                        val c = DriverManager.getConnection("jdbc:mysql://localhost:3306/suppliers", DB_USER, DB_PASS)
-                                        val p = c.prepareStatement("UPDATE supplier_receipts SET paid = NOT paid WHERE id = ?"); p.setInt(1, rid); p.executeUpdate(); c.close(); refresh++
-                                    } catch (_: Exception) { selectedSupplier = null }
-                                }, colors = ButtonDefaults.buttonColors(backgroundColor = if (pd) Color(0xFF1C4A1E) else Color(0xFF9E9E9E)), shape = RoundedCornerShape(4.dp), modifier = Modifier.height(26.dp)) { Text(if (pd) "Paid" else "Unpaid", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold) }
+                                    try { withDb("suppliers") { c -> c.prepareStatement("UPDATE supplier_receipts SET paid = NOT paid WHERE id = ?").apply { setInt(1, rid) }.executeUpdate() }; refresh++ } catch (_: Exception) { selectedSupplier = null }
+                                }, colors = ButtonDefaults.buttonColors(backgroundColor = if (pd) AppColors.Green else Color(0xFF9E9E9E)), shape = RoundedCornerShape(4.dp), modifier = Modifier.height(26.dp)) { Text(if (pd) "Paid" else "Unpaid", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold) }
                             }
                             Divider(color = Color.Gray, thickness = 1.dp, modifier = Modifier.padding(vertical = 4.dp))
                             rs.forEach { itm -> Row(Modifier.fillMaxWidth()) { Text(itm.productName, Modifier.weight(2f), fontSize = 13.sp); Text("x${itm.quantity}", Modifier.weight(1f), fontSize = 13.sp); Text("₹${itm.costPrice}", Modifier.weight(1f), fontSize = 13.sp); Text("₹${itm.quantity * itm.costPrice}", Modifier.weight(1f), fontSize = 13.sp, fontWeight = FontWeight.Bold) } }
@@ -370,7 +384,7 @@ fun SupplierScreen(onBack: () -> Unit) {
                     }
                 }
             }
-        }, confirmButton = { Button(onClick = { selectedSupplier = null }, colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF353535))) { Text("Close", color = Color.White) } }, shape = RoundedCornerShape(12.dp))
+        }, confirmButton = { Button(onClick = { selectedSupplier = null }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Dark)) { Text("Close", color = Color.White) } }, shape = RoundedCornerShape(12.dp))
     }
 
     if (showAdd) AddSupplierReceiptDialog(refresh = { refresh++ }) { showAdd = false }
@@ -384,10 +398,8 @@ fun SupplierScreen(onBack: () -> Unit) {
             }
         }, confirmButton = {
             Button(onClick = {
-                try { val c = DriverManager.getConnection("jdbc:mysql://localhost:3306/suppliers", DB_USER, DB_PASS)
-                    val p = c.prepareStatement("UPDATE supplier SET name=?, phone=? WHERE id=?"); p.setString(1, nm); p.setString(2, ph); p.setInt(3, sup.supplierId); p.executeUpdate(); c.close(); refresh++; editingSupplier = null
-                } catch (e: Exception) { errorMsg = e.message ?: "Update failed" }
-            }, colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF353535))) { Text("Update", color = Color.White) }
+                try { withDb("suppliers") { c -> c.prepareStatement("UPDATE supplier SET name=?, phone=? WHERE id=?").apply { setString(1, nm); setString(2, ph); setInt(3, sup.supplierId) }.executeUpdate() }; refresh++; editingSupplier = null } catch (e: Exception) { errorMsg = e.message ?: "Update failed" }
+            }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Dark)) { Text("Update", color = Color.White) }
         }, dismissButton = { TextButton(onClick = { editingSupplier = null }) { Text("Cancel") } }, shape = RoundedCornerShape(12.dp))
     }
 
@@ -395,10 +407,8 @@ fun SupplierScreen(onBack: () -> Unit) {
         AlertDialog(onDismissRequest = { deletingSupplier = null }, title = { Text("Delete Supplier", fontFamily = girassol) }, text = { Text("Delete ${sup.name} and all their receipts?") },
             confirmButton = {
                 Button(onClick = {
-                    try { val c = DriverManager.getConnection("jdbc:mysql://localhost:3306/suppliers", DB_USER, DB_PASS)
-                        c.prepareStatement("DELETE FROM supplier WHERE id=?").apply { setInt(1, sup.supplierId) }.executeUpdate(); c.close(); refresh++; deletingSupplier = null
-                    } catch (e: Exception) { errorMsg = e.message ?: "Delete failed" }
-                }, colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF760E03))) { Text("Delete", color = Color.White) }
+                    try { withDb("suppliers") { c -> c.prepareStatement("DELETE FROM supplier WHERE id=?").apply { setInt(1, sup.supplierId) }.executeUpdate() }; refresh++; deletingSupplier = null } catch (e: Exception) { errorMsg = e.message ?: "Delete failed" }
+                }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Red)) { Text("Delete", color = Color.White) }
             }, dismissButton = { TextButton(onClick = { deletingSupplier = null }) { Text("Cancel") } }, shape = RoundedCornerShape(12.dp))
     }
 }
@@ -409,26 +419,27 @@ private fun AddSupplierReceiptDialog(refresh: () -> Unit, onClose: () -> Unit) {
     var prodName by remember { mutableStateOf("") }; var itemQty by remember { mutableStateOf("1") }; var itemCost by remember { mutableStateOf("0") }
     val lineItems = remember { mutableStateListOf<LineItem>() }
     var prodList by remember { mutableStateOf(listOf<ProductRow>()) }
-    var showNewForm by remember { mutableStateOf(false) }; var newType by remember { mutableStateOf("") }; var newRack by remember { mutableStateOf("1") }
+    var newType by remember { mutableStateOf("") }; var newRack by remember { mutableStateOf("1") }
 
     LaunchedEffect(Unit) {
         try {
-            val c = DriverManager.getConnection("jdbc:mysql://localhost:3306/stock", DB_USER, DB_PASS)
-            val r = c.createStatement().executeQuery("SELECT id, product_name, cost_price FROM products ORDER BY product_name")
-            val l = mutableListOf<ProductRow>()
-            while (r.next()) l.add(ProductRow(r.getInt("id"), r.getString("product_name"), "", 0, "", "", 0, r.getDouble("cost_price"), 0.0))
-            c.close(); prodList = l
+            withDb("stock") { c ->
+                val r = c.createStatement().executeQuery("SELECT id, product_name, cost_price FROM products ORDER BY product_name")
+                val l = mutableListOf<ProductRow>()
+                while (r.next()) l.add(ProductRow(r.getInt("id"), r.getString("product_name"), "", 0, "", "", 0, r.getDouble("cost_price"), 0.0))
+                prodList = l
+            }
         } catch (e: Exception) { msg = "Failed to load products: ${e.message}" }
     }
 
-    fun resetNewForm() { prodName = ""; itemQty = "1"; itemCost = "0"; showNewForm = false; newType = ""; newRack = "1" }
+    fun resetNewForm() { prodName = ""; itemQty = "1"; itemCost = "0"; newType = ""; newRack = "1" }
 
     AlertDialog(onDismissRequest = onClose, title = { Text(if (step < 2) "New Receipt" else "Add Items to Receipt", fontFamily = girassol) }, text = {
         Column(Modifier.width(420.dp).verticalScroll(rememberScrollState())) {
             when (step) {
                 0 -> {
                     OutlinedTextField(value = nm, onValueChange = { nm = it }, label = { Text("Supplier Name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                    if (msg.isNotBlank()) { Spacer(Modifier.height(4.dp)); Text(msg, color = if (msg.startsWith("Found")) Color(0xFF1C4A1E) else Color(0xFFFF6B6B), fontSize = 13.sp) }
+                    if (msg.isNotBlank()) { Spacer(Modifier.height(4.dp)); Text(msg, color = if (msg.startsWith("Found")) AppColors.Green else Color(0xFFFF6B6B), fontSize = 13.sp) }
                 }
                 1 -> {
                     Text("Supplier '$nm' not found. Enter phone to create:", fontSize = 14.sp, color = Color.Gray)
@@ -443,7 +454,7 @@ private fun AddSupplierReceiptDialog(refresh: () -> Unit, onClose: () -> Unit) {
                     Text("Adding items for: $nm", fontWeight = FontWeight.Bold, fontSize = 14.sp)
                     Spacer(Modifier.height(8.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        OutlinedTextField(value = prodName, onValueChange = { prodName = it; showNewForm = false }, label = { Text("Product") }, singleLine = true, modifier = Modifier.weight(1f))
+                        OutlinedTextField(value = prodName, onValueChange = { prodName = it }, label = { Text("Product") }, singleLine = true, modifier = Modifier.weight(1f))
                         Spacer(Modifier.width(4.dp))
                         OutlinedTextField(value = itemQty, onValueChange = { itemQty = it }, label = { Text("Qty") }, singleLine = true, modifier = Modifier.width(60.dp))
                         Spacer(Modifier.width(4.dp))
@@ -455,7 +466,7 @@ private fun AddSupplierReceiptDialog(refresh: () -> Unit, onClose: () -> Unit) {
                         if (matches.isNotEmpty()) {
                             Text("Suggestions:", fontSize = 11.sp, color = Color.Gray)
                             matches.take(5).forEach { m ->
-                                Text("${m.productName} (₹${m.costPrice})", fontSize = 12.sp, color = Color(0xFF23204B), modifier = Modifier.clickable { prodName = m.productName; itemCost = m.costPrice.toString(); itemQty = "1"; showNewForm = false })
+                                Text("${m.productName} (₹${m.costPrice})", fontSize = 12.sp, color = AppColors.Navy, modifier = Modifier.clickable { prodName = m.productName; itemCost = m.costPrice.toString(); itemQty = "1" })
                             }
                         }
                     }
@@ -463,8 +474,8 @@ private fun AddSupplierReceiptDialog(refresh: () -> Unit, onClose: () -> Unit) {
                     if (match != null) {
                         Button(enabled = itemQty.toIntOrNull() != null && itemQty.toInt() > 0 && itemCost.toDoubleOrNull() != null, onClick = {
                             lineItems.add(LineItem(match.id, match.productName, itemQty.toInt(), itemCost.toDouble()))
-                            prodName = ""; itemQty = "1"; itemCost = match.costPrice.toString(); showNewForm = false
-                        }, colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF23204B))) { Text("+ Add Item", color = Color.White, fontSize = 13.sp) }
+                            prodName = ""; itemQty = "1"; itemCost = match.costPrice.toString()
+                        }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Navy)) { Text("+ Add Item", color = Color.White, fontSize = 13.sp) }
                     } else if (prodName.isNotBlank()) {
                         Text("⚠ Product not in stock", fontSize = 12.sp, color = Color(0xFFFF9966))
                         Spacer(Modifier.height(4.dp))
@@ -482,7 +493,7 @@ private fun AddSupplierReceiptDialog(refresh: () -> Unit, onClose: () -> Unit) {
                                 prodList = prodList + ProductRow(newId, prodName, newType, 0, nm, "", newRack.toIntOrNull() ?: 1, itemCost.toDoubleOrNull() ?: 0.0, 0.0)
                                 resetNewForm()
                             } catch (e: Exception) { msg = e.message ?: "Create failed" }
-                        }, colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF1C4A1E))) { Text("Create Product & Add Item", color = Color.White, fontSize = 13.sp) }
+                        }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Green)) { Text("Create Product & Add Item", color = Color.White, fontSize = 13.sp) }
                     }
                     if (lineItems.isNotEmpty()) {
                         Spacer(Modifier.height(8.dp)); Divider(color = Color.Gray, thickness = 1.dp); Spacer(Modifier.height(4.dp))
@@ -504,7 +515,7 @@ private fun AddSupplierReceiptDialog(refresh: () -> Unit, onClose: () -> Unit) {
                     else { msg = "Not found"; step = 1 }
                     c.close()
                 } catch (e: Exception) { msg = e.message ?: "Error" }
-            }, colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF353535))) { Text("Check", color = Color.White) }
+            }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Dark)) { Text("Check", color = Color.White) }
             1 -> Button(onClick = {
                 if (ph.isBlank()) return@Button
                 try {
@@ -513,7 +524,7 @@ private fun AddSupplierReceiptDialog(refresh: () -> Unit, onClose: () -> Unit) {
                     p.setString(1, nm); p.setString(2, ph); p.executeUpdate()
                     val r = p.generatedKeys; r.next(); foundId = r.getInt(1); c.close(); step = 2
                 } catch (e: Exception) { msg = e.message ?: "Error" }
-            }, colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF1C4A1E))) { Text("Create & Continue", color = Color.White) }
+            }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Green)) { Text("Create & Continue", color = Color.White) }
             2 -> Button(enabled = lineItems.isNotEmpty(), onClick = {
                 try {
                     val c = DriverManager.getConnection("jdbc:mysql://localhost:3306/suppliers", DB_USER, DB_PASS)
@@ -533,7 +544,7 @@ private fun AddSupplierReceiptDialog(refresh: () -> Unit, onClose: () -> Unit) {
                     } finally { c.autoCommit = true; c.close() }
                     onClose()
                 } catch (e: Exception) { msg = e.message ?: "Error" }
-            }, colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF1C4A1E))) { Text("Save Receipt (₹${lineItems.sumOf { it.qty * it.price }})", color = Color.White) }
+            }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Green)) { Text("Save Receipt (₹${lineItems.sumOf { it.qty * it.price }})", color = Color.White) }
         }
     }, dismissButton = { TextButton(onClick = { onClose(); resetNewForm() }) { Text("Cancel") } }, shape = RoundedCornerShape(12.dp))
 }
@@ -547,27 +558,28 @@ fun productScreen(onBack: () -> Unit) {
     val products = remember(refresh) {
         val list = mutableListOf<ProductRow>()
         try {
-            val c = DriverManager.getConnection("jdbc:mysql://localhost:3306/stock", DB_USER, DB_PASS)
-            val r = c.createStatement().executeQuery("SELECT * FROM products ORDER BY product_name")
-            while (r.next()) list.add(ProductRow(r.getInt("id"), r.getString("product_name"), r.getString("type") ?: "", r.getInt("quantity"), r.getString("supplied_by") ?: "", r.getString("warranty") ?: "", r.getInt("rack"), r.getDouble("cost_price"), r.getDouble("selling_price")))
-            c.close(); errorMsg = ""
+            withDb("stock") { c ->
+                val r = c.createStatement().executeQuery("SELECT * FROM products ORDER BY product_name")
+                while (r.next()) list.add(ProductRow(r.getInt("id"), r.getString("product_name"), r.getString("type") ?: "", r.getInt("quantity"), r.getString("supplied_by") ?: "", r.getString("warranty") ?: "", r.getInt("rack"), r.getDouble("cost_price"), r.getDouble("selling_price")))
+            }
+            errorMsg = ""
         } catch (e: Exception) { errorMsg = e.message ?: "Error" }
         list
     }
     val filtered = if (search.isBlank()) products else products.filter { it.productName.contains(search, ignoreCase = true) || it.type.contains(search, ignoreCase = true) }
     val grouped = filtered.groupBy { it.type }
 
-    Box(Modifier.fillMaxSize().background(Color(0xFF2E2E2E))) {
+    Box(Modifier.fillMaxSize().background(AppColors.Bg)) {
         Column(Modifier.fillMaxSize().padding(20.dp)) {
             ScreenHeader("PRODUCTS", onBack) { showAdd = true }
             Spacer(Modifier.height(8.dp)); SearchBar(search, { search = it }, "Search products...")
             if (errorMsg.isNotBlank()) ErrorCard(errorMsg)
             Spacer(Modifier.height(8.dp))
-            Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) { Text("Product", Modifier.weight(2f), Color(0xFFD5C875), fontWeight = FontWeight.Bold); Text("Qty", Modifier.weight(1f), Color(0xFFD5C875), fontWeight = FontWeight.Bold); Text("Cost", Modifier.weight(1f), Color(0xFFD5C875), fontWeight = FontWeight.Bold); Text("Sell", Modifier.weight(1f), Color(0xFFD5C875), fontWeight = FontWeight.Bold); Text("Rack", Modifier.weight(1f), Color(0xFFD5C875), fontWeight = FontWeight.Bold); Text("Actions", Modifier.weight(1.5f), Color(0xFFD5C875), fontWeight = FontWeight.Bold) }
+            Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) { HeaderCell("Product", 2f); HeaderCell("Qty", 1f); HeaderCell("Cost", 1f); HeaderCell("Sell", 1f); HeaderCell("Rack", 1f); HeaderCell("Actions", 1.5f) }
             Divider(color = Color.Gray, thickness = 1.dp)
             Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(top = 6.dp)) {
                 grouped.forEach { (type, items) ->
-                    Text(type, color = Color(0xFFD5C875), fontSize = 18.sp, fontFamily = girassol, modifier = Modifier.padding(vertical = 6.dp))
+                    Text(type, color = AppColors.Gold, fontSize = 18.sp, fontFamily = girassol, modifier = Modifier.padding(vertical = 6.dp))
                     items.forEach { p ->
                         DataCard {
                             Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -577,9 +589,9 @@ fun productScreen(onBack: () -> Unit) {
                                 Text("₹${p.sellingPrice}", Modifier.weight(1f), color = Color(0xFF7EC87E), fontSize = 13.sp)
                                 Text("R${p.rack}", Modifier.weight(1f), color = Color.LightGray, fontSize = 13.sp)
                                 Row(Modifier.weight(1.5f), horizontalArrangement = Arrangement.End) {
-                                    Btn("Edit", Color(0xFF23204B)) { editingProduct = p }
+                                    Btn("Edit", AppColors.Navy) { editingProduct = p }
                                     Spacer(Modifier.width(4.dp))
-                                    Btn("Del", Color(0xFF760E03)) { deletingProduct = p }
+                                    Btn("Del", AppColors.Red) { deletingProduct = p }
                                 }
                             }
                         }
@@ -634,17 +646,15 @@ fun productScreen(onBack: () -> Unit) {
                     }
                     c.close(); refresh++; showAdd = false; editingProduct = null
                 } catch (e: Exception) { errorMsg = e.message ?: "Save failed" }
-            }, colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF353535))) { Text(if (isEdit) "Update" else "Save", color = Color.White) }
+            }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Dark)) { Text(if (isEdit) "Update" else "Save", color = Color.White) }
         }, dismissButton = { TextButton(onClick = { showAdd = false; editingProduct = null }) { Text("Cancel") } }, shape = RoundedCornerShape(12.dp))
     }
 
     deletingProduct?.let { prod ->
         AlertDialog(onDismissRequest = { deletingProduct = null }, title = { Text("Delete Product", fontFamily = girassol) }, text = { Text("Delete ${prod.productName}?") },
             confirmButton = { Button(onClick = {
-                try { val c = DriverManager.getConnection("jdbc:mysql://localhost:3306/stock", DB_USER, DB_PASS)
-                    c.prepareStatement("DELETE FROM products WHERE id=?").apply { setInt(1, prod.id) }.executeUpdate(); c.close(); refresh++; deletingProduct = null
-                } catch (e: Exception) { errorMsg = e.message ?: "Delete failed" }
-            }, colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF760E03))) { Text("Delete", color = Color.White) } },
+                try { withDb("stock") { c -> c.prepareStatement("DELETE FROM products WHERE id=?").apply { setInt(1, prod.id) }.executeUpdate() }; refresh++; deletingProduct = null } catch (e: Exception) { errorMsg = e.message ?: "Delete failed" }
+            }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Red)) { Text("Delete", color = Color.White) } },
             dismissButton = { TextButton(onClick = { deletingProduct = null }) { Text("Cancel") } }, shape = RoundedCornerShape(12.dp))
     }
 }
@@ -658,22 +668,23 @@ fun insuranceScreen(onBack: () -> Unit) {
     val policies = remember(refresh) {
         val list = mutableListOf<InsuranceRow>()
         try {
-            val c = DriverManager.getConnection("jdbc:mysql://localhost:3306/insurance", DB_USER, DB_PASS)
-            val r = c.createStatement().executeQuery("SELECT * FROM insurance ORDER BY expiry_date")
-            while (r.next()) list.add(InsuranceRow(r.getInt("id"), r.getString("customer_name"), r.getString("vehicle_number"), r.getString("driving_license") ?: "", r.getString("pan_number") ?: "", r.getString("rc_number") ?: "", r.getString("insurance_company"), r.getString("policy_name"), r.getDouble("coverage"), r.getString("expiry_date")))
-            c.close(); errorMsg = ""
+            withDb("insurance") { c ->
+                val r = c.createStatement().executeQuery("SELECT * FROM insurance ORDER BY expiry_date")
+                while (r.next()) list.add(InsuranceRow(r.getInt("id"), r.getString("customer_name"), r.getString("vehicle_number"), r.getString("driving_license") ?: "", r.getString("pan_number") ?: "", r.getString("rc_number") ?: "", r.getString("insurance_company"), r.getString("policy_name"), r.getDouble("coverage"), r.getString("expiry_date")))
+            }
+            errorMsg = ""
         } catch (e: Exception) { errorMsg = e.message ?: "Error" }
         list
     }
     val filtered = if (search.isBlank()) policies else policies.filter { it.customerName.contains(search, ignoreCase = true) || it.vehicleNumber.contains(search) || it.policyName.contains(search, ignoreCase = true) }
 
-    Box(Modifier.fillMaxSize().background(Color(0xFF2E2E2E))) {
+    Box(Modifier.fillMaxSize().background(AppColors.Bg)) {
         Column(Modifier.fillMaxSize().padding(20.dp)) {
             ScreenHeader("INSURANCE", onBack) { showAdd = true }
             Spacer(Modifier.height(8.dp)); SearchBar(search, { search = it }, "Search by name, vehicle, or policy...")
             if (errorMsg.isNotBlank()) ErrorCard(errorMsg)
             Spacer(Modifier.height(8.dp))
-            Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) { Text("Customer", Modifier.weight(2f), Color(0xFFD5C875), fontWeight = FontWeight.Bold); Text("Vehicle", Modifier.weight(1.5f), Color(0xFFD5C875), fontWeight = FontWeight.Bold); Text("Policy", Modifier.weight(1.5f), Color(0xFFD5C875), fontWeight = FontWeight.Bold); Text("Coverage", Modifier.weight(1f), Color(0xFFD5C875), fontWeight = FontWeight.Bold); Text("Expires", Modifier.weight(1f), Color(0xFFD5C875), fontWeight = FontWeight.Bold); Text("Actions", Modifier.weight(1.5f), Color(0xFFD5C875), fontWeight = FontWeight.Bold) }
+            Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) { HeaderCell("Customer", 2f); HeaderCell("Vehicle", 1.5f); HeaderCell("Policy", 1.5f); HeaderCell("Coverage", 1f); HeaderCell("Expires", 1f); HeaderCell("Actions", 1.5f) }
             Divider(color = Color.Gray, thickness = 1.dp)
             Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(top = 6.dp)) {
                 filtered.forEach { pol ->
@@ -685,9 +696,9 @@ fun insuranceScreen(onBack: () -> Unit) {
                             Text("₹${pol.coverage}", Modifier.weight(1f), color = Color(0xFF7EC87E), fontSize = 13.sp)
                             Text(pol.expiryDate.take(10), Modifier.weight(1f), color = Color(0xFFFF9966), fontSize = 13.sp)
                             Row(Modifier.weight(1.5f), horizontalArrangement = Arrangement.End) {
-                                Btn("Edit", Color(0xFF23204B)) { editingPolicy = pol }
+                                Btn("Edit", AppColors.Navy) { editingPolicy = pol }
                                 Spacer(Modifier.width(4.dp))
-                                Btn("Del", Color(0xFF760E03)) { deletingPolicy = pol }
+                                Btn("Del", AppColors.Red) { deletingPolicy = pol }
                             }
                         }
                     }
@@ -722,36 +733,34 @@ fun insuranceScreen(onBack: () -> Unit) {
                         p2.setString(1, customerName); p2.setString(2, vehicleNumber); p2.setString(3, drivingLicense); p2.setString(4, panNumber); p2.setString(5, rcNumber); p2.setString(6, insuranceCompany); p2.setString(7, policyName); p2.setDouble(8, coverage.toDoubleOrNull() ?: 0.0); p2.setString(9, expiryDate); p2.executeUpdate() }
                     c.close(); refresh++; showAdd = false; editingPolicy = null
                 } catch (e: Exception) { errorMsg = e.message ?: "Save failed" }
-            }, colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF353535))) { Text(if (isEdit) "Update" else "Save", color = Color.White) }
+            }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Dark)) { Text(if (isEdit) "Update" else "Save", color = Color.White) }
         }, dismissButton = { TextButton(onClick = { showAdd = false; editingPolicy = null }) { Text("Cancel") } }, shape = RoundedCornerShape(12.dp))
     }
 
     deletingPolicy?.let { pol ->
         AlertDialog(onDismissRequest = { deletingPolicy = null }, title = { Text("Delete Policy", fontFamily = girassol) }, text = { Text("Delete policy for ${pol.customerName}?") },
             confirmButton = { Button(onClick = {
-                try { val c = DriverManager.getConnection("jdbc:mysql://localhost:3306/insurance", DB_USER, DB_PASS)
-                    c.prepareStatement("DELETE FROM insurance WHERE id=?").apply { setInt(1, pol.id) }.executeUpdate(); c.close(); refresh++; deletingPolicy = null
-                } catch (e: Exception) { errorMsg = e.message ?: "Delete failed" }
-            }, colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF760E03))) { Text("Delete", color = Color.White) } },
+                try { withDb("insurance") { c -> c.prepareStatement("DELETE FROM insurance WHERE id=?").apply { setInt(1, pol.id) }.executeUpdate() }; refresh++; deletingPolicy = null } catch (e: Exception) { errorMsg = e.message ?: "Delete failed" }
+            }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Red)) { Text("Delete", color = Color.White) } },
             dismissButton = { TextButton(onClick = { deletingPolicy = null }) { Text("Cancel") } }, shape = RoundedCornerShape(12.dp))
     }
 }
 
 @Composable private fun ScreenHeader(title: String, onBack: () -> Unit, onAdd: () -> Unit) {
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Button(onClick = onBack, colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF353535)), modifier = Modifier.size(44.dp)) { Text("←", color = Color.White, fontSize = 18.sp) }
-        Spacer(Modifier.width(12.dp)); Text(title, fontFamily = girassol, color = Color(0xFFD5C875), fontSize = 28.sp, modifier = Modifier.weight(1f))
-        Button(onClick = onAdd, colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF1C4A1E)), shape = RoundedCornerShape(8.dp)) { Text("+ Add", color = Color.White, fontWeight = FontWeight.Bold) }
+        Button(onClick = onBack, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Dark), modifier = Modifier.size(44.dp)) { Text("←", color = Color.White, fontSize = 18.sp) }
+        Spacer(Modifier.width(12.dp)); Text(title, fontFamily = girassol, color = AppColors.Gold, fontSize = 28.sp, modifier = Modifier.weight(1f))
+        Button(onClick = onAdd, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Green), shape = RoundedCornerShape(8.dp)) { Text("+ Add", color = Color.White, fontWeight = FontWeight.Bold) }
     }
 }
 @Composable private fun SearchBar(q: String, o: (String) -> Unit, h: String) {
-    OutlinedTextField(value = q, onValueChange = o, placeholder = { Text(h, color = Color.Gray) }, modifier = Modifier.fillMaxWidth(), singleLine = true, colors = TextFieldDefaults.outlinedTextFieldColors(textColor = Color.White, focusedBorderColor = Color(0xFFD5C875), unfocusedBorderColor = Color.Gray))
+    OutlinedTextField(value = q, onValueChange = o, placeholder = { Text(h, color = Color.Gray) }, modifier = Modifier.fillMaxWidth(), singleLine = true, colors = TextFieldDefaults.outlinedTextFieldColors(textColor = Color.White, focusedBorderColor = AppColors.Gold, unfocusedBorderColor = Color.Gray))
 }
 @Composable private fun ErrorCard(m: String) {
     Card(Modifier.fillMaxWidth().padding(top = 8.dp), backgroundColor = Color(0xFF5C2E2E), shape = RoundedCornerShape(8.dp)) { Text(m, color = Color(0xFFFF6B6B), modifier = Modifier.padding(12.dp)) }
 }
 @Composable private fun DataCard(c: @Composable () -> Unit) {
-    Card(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp), backgroundColor = Color(0xFF3A3A3A), shape = RoundedCornerShape(8.dp), elevation = 3.dp, content = c)
+    Card(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp), backgroundColor = AppColors.Card, shape = RoundedCornerShape(8.dp), elevation = 3.dp, content = c)
 }
 @Composable private fun Btn(t: String, c: Color, a: () -> Unit) {
     Button(onClick = a, colors = ButtonDefaults.buttonColors(backgroundColor = c), shape = RoundedCornerShape(6.dp), modifier = Modifier.height(30.dp)) { Text(t, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold) }
