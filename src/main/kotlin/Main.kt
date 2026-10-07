@@ -18,6 +18,9 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import java.io.File
+import java.security.MessageDigest
 
 val girassol = FontFamily(Font("fonts/girassol.ttf"))
 private const val DB_USER = "root"
@@ -37,6 +40,32 @@ private object AppColors {
 
 private inline fun <T> withDb(db: String, block: (java.sql.Connection) -> T): T =
     DriverManager.getConnection("jdbc:mysql://localhost:3306/$db", DB_USER, DB_PASS).use(block)
+
+private object AuthManager {
+    private val authFile: File
+        get() = File(System.getProperty("user.home"), ".spareparts/auth.dat")
+
+    fun isPasswordSet(): Boolean = try {
+        authFile.exists() && authFile.readText().trim().isNotEmpty()
+    } catch (_: Exception) { false }
+
+    fun verify(input: String): Boolean {
+        if (input.isEmpty()) return false
+        return try {
+            authFile.readText().trim().equals(sha256(input), ignoreCase = true)
+        } catch (_: Exception) { false }
+    }
+
+    fun setPassword(newPass: String) {
+        authFile.parentFile?.mkdirs()
+        authFile.writeText(sha256(newPass))
+    }
+
+    private fun sha256(s: String): String {
+        val bytes = MessageDigest.getInstance("SHA-256").digest(s.toByteArray(Charsets.UTF_8))
+        return bytes.joinToString("") { "%02x".format(it) }
+    }
+}
 
 @Composable
 private fun RowScope.HeaderCell(text: String, weight: Float) {
@@ -59,26 +88,92 @@ fun main() = application {
 
 @Composable
 fun App() {
+    var authenticated by remember { mutableStateOf(false) }
     var screen by remember { mutableStateOf("home") }
-    when (screen) {
-        "home"      -> HomeScreen { screen = it }
-        "supplier"  -> SupplierScreen { screen = "home" }
-        "customer"  -> CustomerScreen { screen = "home" }
-        "product"   -> productScreen { screen = "home" }
-        "insurance" -> insuranceScreen { screen = "home" }
+    if (!authenticated) {
+        if (AuthManager.isPasswordSet()) LockScreen { authenticated = true }
+        else SetupPasswordScreen { authenticated = true }
+    } else {
+        when (screen) {
+            "home"      -> HomeScreen(onNavigate = { screen = it }, onLogout = { authenticated = false; screen = "home" })
+            "supplier"  -> SupplierScreen { screen = "home" }
+            "customer"  -> CustomerScreen { screen = "home" }
+            "product"   -> productScreen { screen = "home" }
+            "insurance" -> insuranceScreen { screen = "home" }
+        }
     }
 }
 
 @Composable
-fun HomeScreen(onNavigate: (String) -> Unit) {
+fun LockScreen(onUnlock: () -> Unit) {
+    var password by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf("") }
+    fun attempt() {
+        if (AuthManager.verify(password)) { error = ""; onUnlock() }
+        else { error = "Incorrect password"; password = "" }
+    }
     Column(Modifier.fillMaxSize().background(AppColors.Bg).padding(20.dp), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
-        Text("WELCOME", fontFamily = girassol, color = Color(0x99FFFFFFA), fontSize = 50.sp)
-
-        Spacer(Modifier.height(30.dp))
-
-        Row { HomeBtn("SUPPLIER") { onNavigate("supplier") }; Spacer(Modifier.width(20.dp)); HomeBtn("CUSTOMER") { onNavigate("customer") } }
+        Text("Enter password to continue", color = Color.Gray, fontSize = 14.sp)
         Spacer(Modifier.height(20.dp))
-        Row { HomeBtn("PRODUCT") { onNavigate("product") }; Spacer(Modifier.width(20.dp)); HomeBtn("INSURANCE") { onNavigate("insurance") } }
+        OutlinedTextField(
+            value = password, onValueChange = { password = it; error = "" },
+            label = { Text("Password") }, singleLine = true,
+            visualTransformation = PasswordVisualTransformation(),
+            modifier = Modifier.width(300.dp),
+            colors = TextFieldDefaults.outlinedTextFieldColors(textColor = Color.White, focusedBorderColor = AppColors.Gold, unfocusedBorderColor = Color.Gray)
+        )
+        if (error.isNotBlank()) { Spacer(Modifier.height(8.dp)); Text(error, color = Color(0xFFFF6B6B), fontSize = 13.sp) }
+        Spacer(Modifier.height(16.dp))
+        Button(onClick = ::attempt, enabled = password.isNotEmpty(), colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Gold), shape = RoundedCornerShape(8.dp), modifier = Modifier.width(300.dp).height(44.dp)) {
+            Text("Login", color = AppColors.Bg, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+@Composable
+fun SetupPasswordScreen(onDone: () -> Unit) {
+    var p1 by remember { mutableStateOf("") }
+    var p2 by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf("") }
+    Column(Modifier.fillMaxSize().background(AppColors.Bg).padding(20.dp), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
+        Text("First launch - create a password", color = Color.Gray, fontSize = 14.sp)
+        Spacer(Modifier.height(20.dp))
+        OutlinedTextField(value = p1, onValueChange = { p1 = it; error = "" }, label = { Text("New password (min 4 chars)") }, singleLine = true, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.width(300.dp),
+            colors = TextFieldDefaults.outlinedTextFieldColors(textColor = Color.White, focusedBorderColor = AppColors.Gold, unfocusedBorderColor = Color.Gray))
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(value = p2, onValueChange = { p2 = it; error = "" }, label = { Text("Confirm password") }, singleLine = true, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.width(300.dp),
+            colors = TextFieldDefaults.outlinedTextFieldColors(textColor = Color.White, focusedBorderColor = AppColors.Gold, unfocusedBorderColor = Color.Gray))
+        if (error.isNotBlank()) { Spacer(Modifier.height(8.dp)); Text(error, color = Color(0xFFFF6B6B), fontSize = 13.sp) }
+        Spacer(Modifier.height(16.dp))
+        Button(onClick = {
+            when {
+                p1.length < 4 -> error = "Password must be at least 4 characters"
+                p1 != p2 -> error = "Passwords do not match"
+                else -> try { AuthManager.setPassword(p1); onDone() } catch (e: Exception) { error = e.message ?: "Save failed" }
+            }
+        }, enabled = p1.isNotEmpty() && p2.isNotEmpty(), colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Gold), shape = RoundedCornerShape(8.dp), modifier = Modifier.width(300.dp).height(44.dp)) {
+            Text("Save & Continue", color = AppColors.Bg, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+@Composable
+fun HomeScreen(onNavigate: (String) -> Unit, onLogout: () -> Unit) {
+    Column(Modifier.fillMaxSize().background(AppColors.Bg).padding(20.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+            Button(onClick = onLogout, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Card), shape = RoundedCornerShape(6.dp), modifier = Modifier.height(32.dp)) {
+                Text("Logout", color = AppColors.Red, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            }
+        }
+        Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
+            Text("WELCOME", fontFamily = girassol, color = Color(0x99FFFFFFA), fontSize = 50.sp)
+
+            Spacer(Modifier.height(30.dp))
+
+            Row { HomeBtn("SUPPLIER") { onNavigate("supplier") }; Spacer(Modifier.width(20.dp)); HomeBtn("CUSTOMER") { onNavigate("customer") } }
+            Spacer(Modifier.height(20.dp))
+            Row { HomeBtn("PRODUCT") { onNavigate("product") }; Spacer(Modifier.width(20.dp)); HomeBtn("INSURANCE") { onNavigate("insurance") } }
+        }
     }
 }
 @Composable private fun HomeBtn(t: String, c: () -> Unit) = Button(onClick = c, modifier = Modifier.size(250.dp, 132.dp).border(1.dp, AppColors.Gold), colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Dark)) { Text(t, fontFamily = girassol, fontSize = 24.sp, color = Color.White) }
@@ -148,7 +243,7 @@ fun CustomerScreen(onBack: () -> Unit) {
                     Card(Modifier.fillMaxWidth().padding(vertical = 3.dp), backgroundColor = Color(0xFFF5F5F5), shape = RoundedCornerShape(8.dp)) {
                         Column(Modifier.padding(10.dp)) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text("Bill #$bid — ${bs.first().billDate.take(10)}", fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                                Text("Bill #$bid - ${bs.first().billDate.take(10)}", fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.weight(1f))
                                 Button(onClick = {
                                     try { withDb("customers") { c -> c.prepareStatement("UPDATE bills SET paid = NOT paid WHERE bill_id = ?").apply { setInt(1, bid) }.executeUpdate() }; refresh++ } catch (_: Exception) { selectedCustomer = null }
                                 }, colors = ButtonDefaults.buttonColors(backgroundColor = if (pd) AppColors.Green else Color(0xFF9E9E9E)), shape = RoundedCornerShape(4.dp), modifier = Modifier.height(26.dp)) { Text(if (pd) "Paid" else "Unpaid", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold) }
@@ -373,7 +468,7 @@ fun SupplierScreen(onBack: () -> Unit) {
                     Card(Modifier.fillMaxWidth().padding(vertical = 3.dp), backgroundColor = Color(0xFFF5F5F5), shape = RoundedCornerShape(8.dp)) {
                         Column(Modifier.padding(10.dp)) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text("Receipt #$rid — ${rs.first().receiptDate.take(10)}", fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                                Text("Receipt #$rid - ${rs.first().receiptDate.take(10)}", fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.weight(1f))
                                 Button(onClick = {
                                     try { withDb("suppliers") { c -> c.prepareStatement("UPDATE supplier_receipts SET paid = NOT paid WHERE id = ?").apply { setInt(1, rid) }.executeUpdate() }; refresh++ } catch (_: Exception) { selectedSupplier = null }
                                 }, colors = ButtonDefaults.buttonColors(backgroundColor = if (pd) AppColors.Green else Color(0xFF9E9E9E)), shape = RoundedCornerShape(4.dp), modifier = Modifier.height(26.dp)) { Text(if (pd) "Paid" else "Unpaid", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold) }
