@@ -21,6 +21,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import java.io.File
 import java.security.MessageDigest
+import java.time.LocalDate
+import java.time.temporal.ChronoUnit
 
 val girassol = FontFamily(Font("fonts/girassol.ttf"))
 private const val DB_USER = "root"
@@ -76,11 +78,49 @@ private fun togglePaid(db: String, sql: String, id: Int, onSuccess: () -> Unit) 
     try { withDb(db) { c -> c.prepareStatement(sql).apply { setInt(1, id) }.executeUpdate() }; onSuccess() } catch (_: Exception) { }
 }
 
+private fun isPhoneOk(s: String) = s.filter(Char::isDigit).length == 10
+private fun isDateOk(s: String): Boolean = try { LocalDate.parse(s.take(10)); true } catch (_: Exception) { false }
+private fun daysUntilExpiry(expiry: String): Long? = try {
+    ChronoUnit.DAYS.between(LocalDate.now(), LocalDate.parse(expiry.take(10)))
+} catch (_: Exception) { null }
+private fun isPanOk(s: String) = s.isBlank() || Regex("[A-Za-z]{5}[0-9]{4}[A-Za-z]").matches(s.trim())
+
+private fun normalizeVehicle(s: String): String? {
+    val t = s.trim().uppercase().replace(" ", "")
+    if (Regex("^[A-Z]{2}-\\d{2}-[A-Z]{1,2}-\\d{4}$").matches(t)) return t
+    if (Regex("^[A-Z]{2}-\\d{2}-\\d{4}$").matches(t)) return t
+    val compact = t.replace("-", "")
+    val full = Regex("^([A-Z]{2})(\\d{2})([A-Z]{1,2})(\\d{4})$").matchEntire(compact)
+    if (full != null) return "${full.groupValues[1]}-${full.groupValues[2]}-${full.groupValues[3]}-${full.groupValues[4]}"
+    if (Regex("^[A-Z]{2}\\d{6}$").matches(compact)) {
+        return "${compact.substring(0, 2)}-${compact.substring(2, 4)}-${compact.substring(4, 8)}"
+    }
+    return null
+}
+private fun isVehicleOk(s: String) = normalizeVehicle(s) != null
+
+private fun showTrayNotification(title: String, message: String) {
+    try {
+        if (!java.awt.SystemTray.isSupported()) return
+        val tray = java.awt.SystemTray.getSystemTray()
+        val img = java.awt.image.BufferedImage(16, 16, java.awt.image.BufferedImage.TYPE_INT_ARGB)
+        val icon = java.awt.TrayIcon(img, "SpareParts")
+        icon.setImageAutoSize(true)
+        try { tray.add(icon) } catch (_: Exception) { return }
+        icon.displayMessage(title, message, java.awt.TrayIcon.MessageType.WARNING)
+    } catch (_: Exception) { }
+}
+
+@Composable
+private fun FieldError(msg: String?) {
+    if (msg != null) Text(msg, color = Color(0xFFFF6B6B), fontSize = 11.sp)
+}
+
 data class CustomerRow(val customerId: Int, val name: String, val phone: String, val billId: Int, val billDate: String, val paid: Boolean, val itemName: String, val quantity: Int, val price: Double)
 data class SupplierRow(val supplierId: Int, val name: String, val phone: String, val receiptId: Int, val receiptDate: String, val paid: Boolean, val productName: String, val quantity: Int, val costPrice: Double)
 data class ProductRow(val id: Int, val productName: String, val type: String, val quantity: Int, val suppliedBy: String, val warranty: String, val rack: Int, val costPrice: Double, val sellingPrice: Double)
 data class InsuranceRow(val id: Int, val customerName: String, val vehicleNumber: String, val drivingLicense: String, val panNumber: String, val rcNumber: String, val insuranceCompany: String, val policyName: String, val coverage: Double, val expiryDate: String)
-data class LineItem(val stockId: Int, val productName: String, val qty: Int, val price: Double)
+data class LineItem(val stockId: Int, val productName: String, val qty: Int, val price: Double, val sellPrice: Double = 0.0)
 
 fun main() = application {
     Window(onCloseRequest = ::exitApplication) { App() }
@@ -90,6 +130,25 @@ fun main() = application {
 fun App() {
     var authenticated by remember { mutableStateOf(false) }
     var screen by remember { mutableStateOf("home") }
+    var trayShown by remember { mutableStateOf(false) }
+    LaunchedEffect(authenticated) {
+        if (authenticated && !trayShown) {
+            trayShown = true
+            try {
+                val exps = withDb("insurance") { c ->
+                    val r = c.createStatement().executeQuery("SELECT expiry_date FROM insurance")
+                    val l = mutableListOf<String>()
+                    while (r.next()) l.add(r.getString("expiry_date") ?: "")
+                    l
+                }
+                val expired = exps.count { (daysUntilExpiry(it) ?: 999) < 0 }
+                val urgent = exps.count { (daysUntilExpiry(it) ?: 999) in 0..7 }
+                if (expired > 0 || urgent > 0) {
+                    showTrayNotification("Insurance alert", "$expired expired, $urgent expiring within 7 days")
+                }
+            } catch (_: Exception) { }
+        }
+    }
     if (!authenticated) {
         if (AuthManager.isPasswordSet()) LockScreen { authenticated = true }
         else SetupPasswordScreen { authenticated = true }
@@ -186,6 +245,7 @@ fun CustomerScreen(onBack: () -> Unit) {
     var showAdd by remember { mutableStateOf(false) }
     var deletingCustomer by remember { mutableStateOf<CustomerRow?>(null) }
     var errorMsg by remember { mutableStateOf("") }
+    var expandedCustomerId by remember { mutableStateOf<Int?>(null) }
 
     val allRows = remember(refresh) {
         val list = mutableListOf<CustomerRow>()
@@ -202,8 +262,21 @@ fun CustomerScreen(onBack: () -> Unit) {
         } catch (e: Exception) { errorMsg = e.message ?: "Error" }
         list
     }
-    val filtered = if (search.isBlank()) allRows else allRows.filter { it.name.contains(search, ignoreCase = true) || it.phone.contains(search) }
-    val grouped = filtered.groupBy { it.name }
+    val vehicleMap = remember(refresh) {
+        try {
+            withDb("customers") { c ->
+                val r = c.createStatement().executeQuery("SELECT customer_id, vehicle_number FROM customer_vehicles ORDER BY id")
+                val m = mutableMapOf<Int, MutableList<String>>()
+                while (r.next()) m.getOrPut(r.getInt("customer_id")) { mutableListOf() }.add(r.getString("vehicle_number"))
+                m.mapValues { it.value.toList() }
+            }
+        } catch (_: Exception) { emptyMap() }
+    }
+    val filtered = if (search.isBlank()) allRows else allRows.filter {
+        it.name.contains(search, ignoreCase = true) || it.phone.contains(search) ||
+            (vehicleMap[it.customerId]?.any { v -> v.contains(search, ignoreCase = true) } == true)
+    }
+    val grouped = filtered.groupBy { it.customerId }
 
     Box(Modifier.fillMaxSize().background(AppColors.Bg)) {
         Column(Modifier.fillMaxSize().padding(20.dp)) {
@@ -211,21 +284,43 @@ fun CustomerScreen(onBack: () -> Unit) {
             Spacer(Modifier.height(8.dp)); SearchBar(search, { search = it }, "Search customers...")
             if (errorMsg.isNotBlank()) ErrorCard(errorMsg)
             Spacer(Modifier.height(8.dp))
-            Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) { HeaderCell("Name", 2f); HeaderCell("Phone", 2f); HeaderCell("Actions", 2.5f) }
+            Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) { HeaderCell("Name", 2f); HeaderCell("Phone", 1.5f); HeaderCell("Vehicle", 2f); HeaderCell("Actions", 2.5f) }
             Divider(color = Color.Gray, thickness = 1.dp)
             Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(top = 6.dp)) {
-                grouped.forEach { (name, rows) ->
-                    val phone = rows.first().phone
+                grouped.forEach { (cid, rows) ->
+                    val first = rows.first()
+                    val vehicles = vehicleMap[cid] ?: emptyList()
+                    val expanded = expandedCustomerId == cid
                     DataCard {
-                        Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Text(name, Modifier.weight(2f), color = Color.White, fontSize = 15.sp)
-                            Text(phone, Modifier.weight(2f), color = Color.LightGray, fontSize = 14.sp)
-                            Row(Modifier.weight(2.5f), horizontalArrangement = Arrangement.End) {
-                                Btn("Bills", AppColors.Gold) { selectedCustomer = name }
-                                Spacer(Modifier.width(4.dp))
-                                Btn("Edit", AppColors.Navy) { editingCustomer = rows.first() }
-                                Spacer(Modifier.width(4.dp))
-                                Btn("Del", AppColors.Red) { deletingCustomer = rows.first() }
+                        Column(Modifier.fillMaxWidth().padding(12.dp)) {
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Text(first.name, Modifier.weight(2f), color = Color.White, fontSize = 15.sp)
+                                Text(first.phone, Modifier.weight(1.5f), color = Color.LightGray, fontSize = 14.sp)
+                                Column(Modifier.weight(2f)) {
+                                    if (vehicles.isEmpty()) Text("No vehicle - edit required", color = Color(0xFFFF6B6B), fontSize = 13.sp)
+                                    else {
+                                        Text(vehicles.first(), color = Color.White, fontSize = 14.sp)
+                                        if (vehicles.size > 1) {
+                                            Text(if (expanded) "Hide" else "+${vehicles.size - 1} more", color = AppColors.Teal, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                                                modifier = Modifier.clickable { expandedCustomerId = if (expanded) null else cid })
+                                        }
+                                    }
+                                }
+                                Row(Modifier.weight(2.5f), horizontalArrangement = Arrangement.End) {
+                                    Btn("Bills", AppColors.Gold) { selectedCustomer = first.name }
+                                    Spacer(Modifier.width(4.dp))
+                                    Btn("Edit", AppColors.Navy) { editingCustomer = first }
+                                    Spacer(Modifier.width(4.dp))
+                                    Btn("Del", AppColors.Red) { deletingCustomer = first }
+                                }
+                            }
+                            if (expanded && vehicles.size > 1) {
+                                Spacer(Modifier.height(6.dp))
+                                Divider(color = Color.Gray, thickness = 0.5.dp)
+                                Spacer(Modifier.height(4.dp))
+                                vehicles.drop(1).forEach { v ->
+                                    Text(v, color = Color.LightGray, fontSize = 13.sp, modifier = Modifier.padding(start = 4.dp, top = 2.dp))
+                                }
                             }
                         }
                     }
@@ -263,14 +358,56 @@ fun CustomerScreen(onBack: () -> Unit) {
 
     editingCustomer?.let { cust ->
         var nm by remember { mutableStateOf(cust.name) }; var ph by remember { mutableStateOf(cust.phone) }
+        val existingVehicles = remember(cust.customerId) { (vehicleMap[cust.customerId] ?: emptyList()).toMutableStateList() }
+        var newVehicle by remember { mutableStateOf("") }
+        val nmErr = if (nm.isBlank()) "Required" else null
+        val phErr = if (!isPhoneOk(ph)) "10 digits required" else null
+        val vehErr = when {
+            existingVehicles.isEmpty() -> "At least 1 vehicle required"
+            existingVehicles.any { !isVehicleOk(it) } -> "Fix invalid numbers (MH-12-AB-1234)"
+            else -> null
+        }
         AlertDialog(onDismissRequest = { editingCustomer = null }, title = { Text("Edit Customer", fontFamily = girassol) }, text = {
-            Column {
-                OutlinedTextField(value = nm, onValueChange = { nm = it }, label = { Text("Name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                Spacer(Modifier.height(8.dp)); OutlinedTextField(value = ph, onValueChange = { ph = it }, label = { Text("Phone") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+            Column(Modifier.width(380.dp).verticalScroll(rememberScrollState())) {
+                OutlinedTextField(value = nm, onValueChange = { nm = it }, label = { Text("Name") }, singleLine = true, modifier = Modifier.fillMaxWidth(), isError = nmErr != null)
+                FieldError(nmErr)
+                Spacer(Modifier.height(8.dp)); OutlinedTextField(value = ph, onValueChange = { ph = it }, label = { Text("Phone") }, singleLine = true, modifier = Modifier.fillMaxWidth(), isError = phErr != null)
+                FieldError(phErr)
+                Spacer(Modifier.height(8.dp))
+                Text("Vehicles (${existingVehicles.size}) - required", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                Spacer(Modifier.height(4.dp))
+                existingVehicles.forEach { v ->
+                    val ok = isVehicleOk(v)
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 2.dp)) {
+                        Text(v, Modifier.weight(1f), fontSize = 13.sp, color = if (ok) Color.Unspecified else Color(0xFFFF6B6B))
+                        TextButton(onClick = { existingVehicles.remove(v) }) { Text("Remove", color = Color(0xFFFF6B6B), fontSize = 12.sp) }
+                    }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(value = newVehicle, onValueChange = { newVehicle = it.uppercase() }, label = { Text("Add vehicle (MH-12-AB-1234)") }, singleLine = true, modifier = Modifier.weight(1f), isError = newVehicle.isNotBlank() && normalizeVehicle(newVehicle) == null)
+                    Spacer(Modifier.width(6.dp))
+                    Button(enabled = normalizeVehicle(newVehicle)?.let { nv -> existingVehicles.none { e -> normalizeVehicle(e) == nv } } == true,
+                        onClick = { normalizeVehicle(newVehicle)?.let { existingVehicles.add(it) }; newVehicle = "" },
+                        colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Navy)) { Text("Add", color = Color.White, fontSize = 12.sp) }
+                }
+                if (newVehicle.isNotBlank() && normalizeVehicle(newVehicle) == null) FieldError("Format: MH-12-AB-1234")
+                FieldError(vehErr)
             }
         }, confirmButton = {
-            Button(onClick = {
-                try { withDb("customers") { c -> c.prepareStatement("UPDATE customer SET name=?, phone=? WHERE id=?").apply { setString(1, nm); setString(2, ph); setInt(3, cust.customerId) }.executeUpdate() }; refresh++; editingCustomer = null } catch (e: Exception) { errorMsg = e.message ?: "Update failed" }
+            Button(enabled = nmErr == null && phErr == null && vehErr == null, onClick = {
+                try {
+                    withDb("customers") { c ->
+                        c.autoCommit = false
+                        try {
+                            c.prepareStatement("UPDATE customer SET name=?, phone=? WHERE id=?").apply { setString(1, nm); setString(2, ph); setInt(3, cust.customerId) }.executeUpdate()
+                            c.prepareStatement("DELETE FROM customer_vehicles WHERE customer_id=?").apply { setInt(1, cust.customerId) }.executeUpdate()
+                            val pv = c.prepareStatement("INSERT INTO customer_vehicles (customer_id, vehicle_number) VALUES (?, ?)")
+                            existingVehicles.forEach { v -> pv.setInt(1, cust.customerId); pv.setString(2, v.trim().uppercase()); pv.executeUpdate() }
+                            c.commit()
+                        } catch (ex: Exception) { c.rollback(); throw ex }
+                        finally { c.autoCommit = true }
+                    }; refresh++; editingCustomer = null
+                } catch (e: Exception) { errorMsg = e.message ?: "Update failed" }
             }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Dark)) { Text("Update", color = Color.White) }
         }, dismissButton = { TextButton(onClick = { editingCustomer = null }) { Text("Cancel") } }, shape = RoundedCornerShape(12.dp))
     }
@@ -290,6 +427,8 @@ private fun AddCustomerBillDialog(refresh: () -> Unit, onClose: () -> Unit) {
     var step by remember { mutableStateOf(0) }; var nm by remember { mutableStateOf("") }; var ph by remember { mutableStateOf("") }; var foundId by remember { mutableStateOf<Int?>(null) }; var msg by remember { mutableStateOf("") }
     var prodName by remember { mutableStateOf("") }; var itemQty by remember { mutableStateOf("1") }; var itemPrice by remember { mutableStateOf("0") }
     val lineItems = remember { mutableStateListOf<LineItem>() }
+    val newVehicles = remember { mutableStateListOf<String>() }
+    var newVehicleInput by remember { mutableStateOf("") }
     var prodList by remember { mutableStateOf(listOf<ProductRow>()) }
 
     LaunchedEffect(Unit) {
@@ -313,8 +452,26 @@ private fun AddCustomerBillDialog(refresh: () -> Unit, onClose: () -> Unit) {
                     ) else Color(0xFFFF6B6B), fontSize = 13.sp) }
                 }
                 1 -> {
-                    Text("Customer '$nm' not found. Enter phone to create:", fontSize = 14.sp, color = Color.Gray)
-                    Spacer(Modifier.height(8.dp)); OutlinedTextField(value = ph, onValueChange = { ph = it }, label = { Text("Phone") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    Text("Customer '$nm' not found. Enter phone + vehicle to create:", fontSize = 14.sp, color = Color.Gray)
+                    Spacer(Modifier.height(8.dp)); OutlinedTextField(value = ph, onValueChange = { ph = it }, label = { Text("Phone (10 digits)") }, singleLine = true, modifier = Modifier.fillMaxWidth(), isError = ph.isNotEmpty() && !isPhoneOk(ph))
+                    if (ph.isNotEmpty() && !isPhoneOk(ph)) FieldError("10 digits required")
+                    Spacer(Modifier.height(8.dp))
+                    Text("Vehicles (${newVehicles.size}) - at least 1 required", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    newVehicles.forEach { v ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(v, Modifier.weight(1f), fontSize = 13.sp)
+                            TextButton(onClick = { newVehicles.remove(v) }) { Text("Remove", color = Color(0xFFFF6B6B), fontSize = 12.sp) }
+                        }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedTextField(value = newVehicleInput, onValueChange = { newVehicleInput = it.uppercase() }, label = { Text("Vehicle (MH-12-AB-1234)") }, singleLine = true, modifier = Modifier.weight(1f), isError = newVehicleInput.isNotBlank() && normalizeVehicle(newVehicleInput) == null)
+                        Spacer(Modifier.width(6.dp))
+                        Button(enabled = normalizeVehicle(newVehicleInput)?.let { nv -> newVehicles.none { e -> normalizeVehicle(e) == nv } } == true,
+                            onClick = { normalizeVehicle(newVehicleInput)?.let { newVehicles.add(it) }; newVehicleInput = "" },
+                            colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Navy)) { Text("Add", color = Color.White, fontSize = 12.sp) }
+                    }
+                    if (newVehicleInput.isNotBlank() && normalizeVehicle(newVehicleInput) == null) FieldError("Format: MH-12-AB-1234")
+                    if (newVehicles.isEmpty()) FieldError("At least 1 vehicle required")
                 }
                 2 -> {
                     if (msg.isNotBlank()) {
@@ -341,7 +498,13 @@ private fun AddCustomerBillDialog(refresh: () -> Unit, onClose: () -> Unit) {
                         }
                     }
                     Spacer(Modifier.height(8.dp))
-                    Button(onClick = {
+                    run {
+                        val qtyOk = itemQty.toIntOrNull() != null && itemQty.toInt() > 0
+                        val priceOk = itemPrice.toDoubleOrNull() != null && itemPrice.toDouble() >= 0
+                        if (!qtyOk) FieldError("Qty must be > 0")
+                        if (!priceOk) FieldError("Price must be 0 or more")
+                    }
+                    Button(enabled = prodList.any { it.productName.equals(prodName, ignoreCase = true) } && (itemQty.toIntOrNull() ?: 0) > 0 && (itemPrice.toDoubleOrNull() ?: -1.0) >= 0, onClick = {
                         val match = prodList.find { it.productName.equals(prodName, ignoreCase = true) }
                         if (match != null && itemQty.toIntOrNull() != null && itemQty.toInt() > 0 && itemPrice.toDoubleOrNull() != null) {
                             lineItems.add(LineItem(match.id, match.productName, itemQty.toInt(), itemPrice.toDouble()))
@@ -359,7 +522,7 @@ private fun AddCustomerBillDialog(refresh: () -> Unit, onClose: () -> Unit) {
         }
     }, confirmButton = {
         when (step) {
-            0 -> Button(onClick = {
+            0 -> Button(enabled = nm.isNotBlank(), onClick = {
                 if (nm.isBlank()) return@Button
                 try {
                     val c = DriverManager.getConnection("jdbc:mysql://localhost:3306/customers", DB_USER, DB_PASS)
@@ -369,13 +532,22 @@ private fun AddCustomerBillDialog(refresh: () -> Unit, onClose: () -> Unit) {
                     c.close()
                 } catch (e: Exception) { msg = e.message ?: "Error" }
             }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Dark)) { Text("Check", color = Color.White) }
-            1 -> Button(onClick = {
-                if (ph.isBlank()) return@Button
+            1 -> Button(enabled = isPhoneOk(ph) && newVehicles.isNotEmpty(), onClick = {
+                if (!isPhoneOk(ph) || newVehicles.isEmpty()) return@Button
                 try {
                     val c = DriverManager.getConnection("jdbc:mysql://localhost:3306/customers", DB_USER, DB_PASS)
-                    val p = c.prepareStatement("INSERT INTO customer (name, phone) VALUES (?, ?)", java.sql.Statement.RETURN_GENERATED_KEYS)
-                    p.setString(1, nm); p.setString(2, ph); p.executeUpdate()
-                    val r = p.generatedKeys; r.next(); foundId = r.getInt(1); c.close(); step = 2
+                    c.autoCommit = false
+                    try {
+                        val p = c.prepareStatement("INSERT INTO customer (name, phone) VALUES (?, ?)", java.sql.Statement.RETURN_GENERATED_KEYS)
+                        p.setString(1, nm); p.setString(2, ph); p.executeUpdate()
+                        val r = p.generatedKeys; r.next(); foundId = r.getInt(1)
+                        try {
+                            val pv = c.prepareStatement("INSERT INTO customer_vehicles (customer_id, vehicle_number) VALUES (?, ?)")
+                            newVehicles.forEach { v -> pv.setInt(1, foundId!!); pv.setString(2, v.trim().uppercase()); pv.executeUpdate() }
+                        } catch (_: Exception) { }
+                        c.commit(); step = 2
+                    } catch (ex: Exception) { c.rollback(); msg = ex.message ?: "Error"; return@Button }
+                    finally { c.autoCommit = true; c.close() }
                 } catch (e: Exception) { msg = e.message ?: "Error" }
             }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Green)) { Text("Create & Continue", color = Color.White) }
             2 -> Button(enabled = lineItems.isNotEmpty(), onClick = {
@@ -411,6 +583,7 @@ fun SupplierScreen(onBack: () -> Unit) {
     var showAdd by remember { mutableStateOf(false) }
     var deletingSupplier by remember { mutableStateOf<SupplierRow?>(null) }
     var errorMsg by remember { mutableStateOf("") }
+    var expandedSupplierId by remember { mutableStateOf<Int?>(null) }
 
     val allRows = remember(refresh) {
         val list = mutableListOf<SupplierRow>()
@@ -427,8 +600,21 @@ fun SupplierScreen(onBack: () -> Unit) {
         } catch (e: Exception) { errorMsg = e.message ?: "Error" }
         list
     }
-    val filtered = if (search.isBlank()) allRows else allRows.filter { it.name.contains(search, ignoreCase = true) || it.phone.contains(search) }
-    val grouped = filtered.groupBy { it.name }
+    val addressMap = remember(refresh) {
+        try {
+            withDb("suppliers") { c ->
+                val r = c.createStatement().executeQuery("SELECT supplier_id, address FROM supplier_addresses ORDER BY id")
+                val m = mutableMapOf<Int, MutableList<String>>()
+                while (r.next()) m.getOrPut(r.getInt("supplier_id")) { mutableListOf() }.add(r.getString("address"))
+                m.mapValues { it.value.toList() }
+            }
+        } catch (_: Exception) { emptyMap() }
+    }
+    val filtered = if (search.isBlank()) allRows else allRows.filter {
+        it.name.contains(search, ignoreCase = true) || it.phone.contains(search) ||
+            (addressMap[it.supplierId]?.any { a -> a.contains(search, ignoreCase = true) } == true)
+    }
+    val grouped = filtered.groupBy { it.supplierId }
 
     Box(Modifier.fillMaxSize().background(AppColors.Bg)) {
         Column(Modifier.fillMaxSize().padding(20.dp)) {
@@ -436,21 +622,43 @@ fun SupplierScreen(onBack: () -> Unit) {
             Spacer(Modifier.height(8.dp)); SearchBar(search, { search = it }, "Search suppliers...")
             if (errorMsg.isNotBlank()) ErrorCard(errorMsg)
             Spacer(Modifier.height(8.dp))
-            Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) { HeaderCell("Name", 2f); HeaderCell("Phone", 2f); HeaderCell("Actions", 2.5f) }
+            Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) { HeaderCell("Name", 2f); HeaderCell("Phone", 1.5f); HeaderCell("Address", 2f); HeaderCell("Actions", 2.5f) }
             Divider(color = Color.Gray, thickness = 1.dp)
             Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(top = 6.dp)) {
-                grouped.forEach { (name, rows) ->
-                    val phone = rows.first().phone
+                grouped.forEach { (sid, rows) ->
+                    val first = rows.first()
+                    val addresses = addressMap[sid] ?: emptyList()
+                    val expanded = expandedSupplierId == sid
                     DataCard {
-                        Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Text(name, Modifier.weight(2f), color = Color.White, fontSize = 15.sp)
-                            Text(phone, Modifier.weight(2f), color = Color.LightGray, fontSize = 14.sp)
-                            Row(Modifier.weight(2.5f), horizontalArrangement = Arrangement.End) {
-                                Btn("View", AppColors.Green) { selectedSupplier = name }
-                                Spacer(Modifier.width(4.dp))
-                                Btn("Edit", AppColors.Navy) { editingSupplier = rows.first() }
-                                Spacer(Modifier.width(4.dp))
-                                Btn("Del", AppColors.Red) { deletingSupplier = rows.first() }
+                        Column(Modifier.fillMaxWidth().padding(12.dp)) {
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Text(first.name, Modifier.weight(2f), color = Color.White, fontSize = 15.sp)
+                                Text(first.phone, Modifier.weight(1.5f), color = Color.LightGray, fontSize = 14.sp)
+                                Column(Modifier.weight(2f)) {
+                                    if (addresses.isEmpty()) Text("No address - edit required", color = Color(0xFFFF6B6B), fontSize = 13.sp)
+                                    else {
+                                        Text(addresses.first(), color = Color.White, fontSize = 13.sp, maxLines = 2)
+                                        if (addresses.size > 1) {
+                                            Text(if (expanded) "Hide" else "+${addresses.size - 1} more", color = AppColors.Teal, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                                                modifier = Modifier.clickable { expandedSupplierId = if (expanded) null else sid })
+                                        }
+                                    }
+                                }
+                                Row(Modifier.weight(2.5f), horizontalArrangement = Arrangement.End) {
+                                    Btn("View", AppColors.Green) { selectedSupplier = first.name }
+                                    Spacer(Modifier.width(4.dp))
+                                    Btn("Edit", AppColors.Navy) { editingSupplier = first }
+                                    Spacer(Modifier.width(4.dp))
+                                    Btn("Del", AppColors.Red) { deletingSupplier = first }
+                                }
+                            }
+                            if (expanded && addresses.size > 1) {
+                                Spacer(Modifier.height(6.dp))
+                                Divider(color = Color.Gray, thickness = 0.5.dp)
+                                Spacer(Modifier.height(4.dp))
+                                addresses.drop(1).forEach { a ->
+                                    Text(a, color = Color.LightGray, fontSize = 13.sp, modifier = Modifier.padding(start = 4.dp, top = 2.dp))
+                                }
                             }
                         }
                     }
@@ -488,14 +696,52 @@ fun SupplierScreen(onBack: () -> Unit) {
 
     editingSupplier?.let { sup ->
         var nm by remember { mutableStateOf(sup.name) }; var ph by remember { mutableStateOf(sup.phone) }
+        val existingAddresses = remember(sup.supplierId) { (addressMap[sup.supplierId] ?: emptyList()).toMutableStateList() }
+        var newAddress by remember { mutableStateOf("") }
+        val nmErr = if (nm.isBlank()) "Required" else null
+        val phErr = if (!isPhoneOk(ph)) "10 digits required" else null
+        val addrErr = if (existingAddresses.isEmpty()) "At least 1 address required" else null
         AlertDialog(onDismissRequest = { editingSupplier = null }, title = { Text("Edit Supplier", fontFamily = girassol) }, text = {
-            Column {
-                OutlinedTextField(value = nm, onValueChange = { nm = it }, label = { Text("Name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                Spacer(Modifier.height(8.dp)); OutlinedTextField(value = ph, onValueChange = { ph = it }, label = { Text("Phone") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+            Column(Modifier.width(380.dp).verticalScroll(rememberScrollState())) {
+                OutlinedTextField(value = nm, onValueChange = { nm = it }, label = { Text("Name") }, singleLine = true, modifier = Modifier.fillMaxWidth(), isError = nmErr != null)
+                FieldError(nmErr)
+                Spacer(Modifier.height(8.dp)); OutlinedTextField(value = ph, onValueChange = { ph = it }, label = { Text("Phone") }, singleLine = true, modifier = Modifier.fillMaxWidth(), isError = phErr != null)
+                FieldError(phErr)
+                Spacer(Modifier.height(8.dp))
+                Text("Addresses (${existingAddresses.size}) - required", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                Spacer(Modifier.height(4.dp))
+                existingAddresses.forEach { a ->
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 2.dp)) {
+                        Text(a, Modifier.weight(1f), fontSize = 13.sp)
+                        TextButton(onClick = { existingAddresses.remove(a) }) { Text("Remove", color = Color(0xFFFF6B6B), fontSize = 12.sp) }
+                    }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(value = newAddress, onValueChange = { newAddress = it }, label = { Text("Add address") }, singleLine = true, modifier = Modifier.weight(1f))
+                    Spacer(Modifier.width(6.dp))
+                    Button(enabled = newAddress.trim().length >= 5 && !existingAddresses.any { it.equals(newAddress.trim(), ignoreCase = true) },
+                        onClick = { existingAddresses.add(newAddress.trim()); newAddress = "" },
+                        colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Navy)) { Text("Add", color = Color.White, fontSize = 12.sp) }
+                }
+                FieldError(addrErr)
             }
         }, confirmButton = {
-            Button(onClick = {
-                try { withDb("suppliers") { c -> c.prepareStatement("UPDATE supplier SET name=?, phone=? WHERE id=?").apply { setString(1, nm); setString(2, ph); setInt(3, sup.supplierId) }.executeUpdate() }; refresh++; editingSupplier = null } catch (e: Exception) { errorMsg = e.message ?: "Update failed" }
+            Button(enabled = nmErr == null && phErr == null && addrErr == null, onClick = {
+                try {
+                    withDb("suppliers") { c ->
+                        c.autoCommit = false
+                        try {
+                            c.prepareStatement("UPDATE supplier SET name=?, phone=? WHERE id=?").apply { setString(1, nm); setString(2, ph); setInt(3, sup.supplierId) }.executeUpdate()
+                            try {
+                                c.prepareStatement("DELETE FROM supplier_addresses WHERE supplier_id=?").apply { setInt(1, sup.supplierId) }.executeUpdate()
+                                val pa = c.prepareStatement("INSERT INTO supplier_addresses (supplier_id, address) VALUES (?, ?)")
+                                existingAddresses.forEach { a -> pa.setInt(1, sup.supplierId); pa.setString(2, a.trim()); pa.executeUpdate() }
+                            } catch (_: Exception) { }
+                            c.commit()
+                        } catch (ex: Exception) { c.rollback(); throw ex }
+                        finally { c.autoCommit = true }
+                    }; refresh++; editingSupplier = null
+                } catch (e: Exception) { errorMsg = e.message ?: "Update failed" }
             }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Dark)) { Text("Update", color = Color.White) }
         }, dismissButton = { TextButton(onClick = { editingSupplier = null }) { Text("Cancel") } }, shape = RoundedCornerShape(12.dp))
     }
@@ -513,23 +759,25 @@ fun SupplierScreen(onBack: () -> Unit) {
 @Composable
 private fun AddSupplierReceiptDialog(refresh: () -> Unit, onClose: () -> Unit) {
     var step by remember { mutableStateOf(0) }; var nm by remember { mutableStateOf("") }; var ph by remember { mutableStateOf("") }; var foundId by remember { mutableStateOf<Int?>(null) }; var msg by remember { mutableStateOf("") }
-    var prodName by remember { mutableStateOf("") }; var itemQty by remember { mutableStateOf("1") }; var itemCost by remember { mutableStateOf("0") }
+    var prodName by remember { mutableStateOf("") }; var itemQty by remember { mutableStateOf("1") }; var itemCost by remember { mutableStateOf("0") }; var itemSell by remember { mutableStateOf("0") }
     val lineItems = remember { mutableStateListOf<LineItem>() }
+    val newAddresses = remember { mutableStateListOf<String>() }
+    var newAddressInput by remember { mutableStateOf("") }
     var prodList by remember { mutableStateOf(listOf<ProductRow>()) }
     var newType by remember { mutableStateOf("") }; var newRack by remember { mutableStateOf("1") }
 
     LaunchedEffect(Unit) {
         try {
             withDb("stock") { c ->
-                val r = c.createStatement().executeQuery("SELECT id, product_name, cost_price FROM products ORDER BY product_name")
+                val r = c.createStatement().executeQuery("SELECT id, product_name, cost_price, selling_price FROM products ORDER BY product_name")
                 val l = mutableListOf<ProductRow>()
-                while (r.next()) l.add(ProductRow(r.getInt("id"), r.getString("product_name"), "", 0, "", "", 0, r.getDouble("cost_price"), 0.0))
+                while (r.next()) l.add(ProductRow(r.getInt("id"), r.getString("product_name"), "", 0, "", "", 0, r.getDouble("cost_price"), r.getDouble("selling_price")))
                 prodList = l
             }
         } catch (e: Exception) { msg = "Failed to load products: ${e.message}" }
     }
 
-    fun resetNewForm() { prodName = ""; itemQty = "1"; itemCost = "0"; newType = ""; newRack = "1" }
+    fun resetNewForm() { prodName = ""; itemQty = "1"; itemCost = "0"; itemSell = "0"; newType = ""; newRack = "1" }
 
     AlertDialog(onDismissRequest = onClose, title = { Text(if (step < 2) "New Receipt" else "Add Items to Receipt", fontFamily = girassol) }, text = {
         Column(Modifier.width(420.dp).verticalScroll(rememberScrollState())) {
@@ -539,8 +787,25 @@ private fun AddSupplierReceiptDialog(refresh: () -> Unit, onClose: () -> Unit) {
                     if (msg.isNotBlank()) { Spacer(Modifier.height(4.dp)); Text(msg, color = if (msg.startsWith("Found")) AppColors.Green else Color(0xFFFF6B6B), fontSize = 13.sp) }
                 }
                 1 -> {
-                    Text("Supplier '$nm' not found. Enter phone to create:", fontSize = 14.sp, color = Color.Gray)
-                    Spacer(Modifier.height(8.dp)); OutlinedTextField(value = ph, onValueChange = { ph = it }, label = { Text("Phone") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    Text("Supplier '$nm' not found. Enter phone + address to create:", fontSize = 14.sp, color = Color.Gray)
+                    Spacer(Modifier.height(8.dp)); OutlinedTextField(value = ph, onValueChange = { ph = it }, label = { Text("Phone (10 digits)") }, singleLine = true, modifier = Modifier.fillMaxWidth(), isError = ph.isNotEmpty() && !isPhoneOk(ph))
+                    if (ph.isNotEmpty() && !isPhoneOk(ph)) FieldError("10 digits required")
+                    Spacer(Modifier.height(8.dp))
+                    Text("Addresses (${newAddresses.size}) - at least 1 required", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    newAddresses.forEach { a ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(a, Modifier.weight(1f), fontSize = 13.sp)
+                            TextButton(onClick = { newAddresses.remove(a) }) { Text("Remove", color = Color(0xFFFF6B6B), fontSize = 12.sp) }
+                        }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedTextField(value = newAddressInput, onValueChange = { newAddressInput = it }, label = { Text("Address") }, singleLine = true, modifier = Modifier.weight(1f))
+                        Spacer(Modifier.width(6.dp))
+                        Button(enabled = newAddressInput.trim().length >= 5 && !newAddresses.any { it.equals(newAddressInput.trim(), ignoreCase = true) },
+                            onClick = { newAddresses.add(newAddressInput.trim()); newAddressInput = "" },
+                            colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Navy)) { Text("Add", color = Color.White, fontSize = 12.sp) }
+                    }
+                    if (newAddresses.isEmpty()) FieldError("At least 1 address required")
                 }
                 2 -> {
                     if (msg.isNotBlank()) {
@@ -553,9 +818,11 @@ private fun AddSupplierReceiptDialog(refresh: () -> Unit, onClose: () -> Unit) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         OutlinedTextField(value = prodName, onValueChange = { prodName = it }, label = { Text("Product") }, singleLine = true, modifier = Modifier.weight(1f))
                         Spacer(Modifier.width(4.dp))
-                        OutlinedTextField(value = itemQty, onValueChange = { itemQty = it }, label = { Text("Qty") }, singleLine = true, modifier = Modifier.width(60.dp))
+                        OutlinedTextField(value = itemQty, onValueChange = { itemQty = it }, label = { Text("Qty") }, singleLine = true, modifier = Modifier.width(55.dp))
                         Spacer(Modifier.width(4.dp))
-                        OutlinedTextField(value = itemCost, onValueChange = { itemCost = it }, label = { Text("₹") }, singleLine = true, modifier = Modifier.width(70.dp))
+                        OutlinedTextField(value = itemCost, onValueChange = { itemCost = it }, label = { Text("Cost price (₹)") }, singleLine = true, modifier = Modifier.width(85.dp))
+                        Spacer(Modifier.width(4.dp))
+                        OutlinedTextField(value = itemSell, onValueChange = { itemSell = it }, label = { Text("Selling price (₹)") }, singleLine = true, modifier = Modifier.width(85.dp))
                     }
                     val match = prodList.find { it.productName.equals(prodName, ignoreCase = true) }
                     if (prodName.isNotBlank()) {
@@ -563,31 +830,41 @@ private fun AddSupplierReceiptDialog(refresh: () -> Unit, onClose: () -> Unit) {
                         if (matches.isNotEmpty()) {
                             Text("Suggestions:", fontSize = 11.sp, color = Color.Gray)
                             matches.take(5).forEach { m ->
-                                Text("${m.productName} (₹${m.costPrice})", fontSize = 12.sp, color = AppColors.Navy, modifier = Modifier.clickable { prodName = m.productName; itemCost = m.costPrice.toString(); itemQty = "1" })
+                                Text("${m.productName} (cost ₹${m.costPrice}, sell ₹${m.sellingPrice})", fontSize = 12.sp, color = AppColors.Navy, modifier = Modifier.clickable { prodName = m.productName; itemCost = m.costPrice.toString(); itemSell = m.sellingPrice.toString(); itemQty = "1" })
                             }
                         }
                     }
                     Spacer(Modifier.height(6.dp))
                     if (match != null) {
-                        Button(enabled = itemQty.toIntOrNull() != null && itemQty.toInt() > 0 && itemCost.toDoubleOrNull() != null, onClick = {
-                            lineItems.add(LineItem(match.id, match.productName, itemQty.toInt(), itemCost.toDouble()))
-                            prodName = ""; itemQty = "1"; itemCost = match.costPrice.toString()
+                        run {
+                            if ((itemCost.toDoubleOrNull() ?: -1.0) < 0) FieldError("Cost must be 0 or more")
+                            if ((itemSell.toDoubleOrNull() ?: -1.0) < 0) FieldError("Selling price must be 0 or more")
+                        }
+                        Button(enabled = itemQty.toIntOrNull() != null && itemQty.toInt() > 0 && (itemCost.toDoubleOrNull() ?: -1.0) >= 0 && (itemSell.toDoubleOrNull() ?: -1.0) >= 0, onClick = {
+                            lineItems.add(LineItem(match.id, match.productName, itemQty.toInt(), itemCost.toDouble(), itemSell.toDouble()))
+                            prodName = ""; itemQty = "1"; itemCost = match.costPrice.toString(); itemSell = match.sellingPrice.toString()
                         }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Navy)) { Text("+ Add Item", color = Color.White, fontSize = 13.sp) }
                     } else if (prodName.isNotBlank()) {
                         Text("⚠ Product not in stock", fontSize = 12.sp, color = Color(0xFFFF9966))
                         Spacer(Modifier.height(4.dp))
                         Text("New product details:", fontSize = 12.sp, color = Color.White, fontWeight = FontWeight.Bold)
-                        Row { OutlinedTextField(value = newType, onValueChange = { newType = it }, label = { Text("Type") }, singleLine = true, modifier = Modifier.weight(1f)); Spacer(Modifier.width(6.dp)); OutlinedTextField(value = newRack, onValueChange = { newRack = it }, label = { Text("Rack (1-30)") }, singleLine = true, modifier = Modifier.weight(1f)) }
+                        Row { OutlinedTextField(value = newType, onValueChange = { newType = it }, label = { Text("Type") }, singleLine = true, modifier = Modifier.weight(1f), isError = prodName.isNotBlank() && newType.isBlank()); Spacer(Modifier.width(6.dp)); OutlinedTextField(value = newRack, onValueChange = { newRack = it }, label = { Text("Rack (1-30)") }, singleLine = true, modifier = Modifier.weight(1f), isError = (newRack.toIntOrNull() ?: -1) !in 1..30) }
+                        run {
+                            if (prodName.isNotBlank() && newType.isBlank()) FieldError("Type required")
+                            if ((newRack.toIntOrNull() ?: -1) !in 1..30) FieldError("Rack must be 1-30")
+                            if ((itemCost.toDoubleOrNull() ?: -1.0) < 0) FieldError("Cost must be 0 or more")
+                            if ((itemSell.toDoubleOrNull() ?: -1.0) < 0) FieldError("Selling price must be 0 or more")
+                        }
                         Spacer(Modifier.height(4.dp))
-                        Button(enabled = itemQty.toIntOrNull() != null && itemQty.toInt() > 0 && itemCost.toDoubleOrNull() != null && newType.isNotBlank(), onClick = {
+                        Button(enabled = itemQty.toIntOrNull() != null && itemQty.toInt() > 0 && (itemCost.toDoubleOrNull() ?: -1.0) >= 0 && (itemSell.toDoubleOrNull() ?: -1.0) >= 0 && newType.isNotBlank() && (newRack.toIntOrNull() ?: -1) in 1..30, onClick = {
                             try {
                                 val sc = DriverManager.getConnection("jdbc:mysql://localhost:3306/stock", DB_USER, DB_PASS)
-                                val ip = sc.prepareStatement("INSERT INTO products (product_name, type, quantity, supplied_by, warranty, rack, cost_price, selling_price) VALUES (?, ?, 0, ?, '', ?, ?, 0)", java.sql.Statement.RETURN_GENERATED_KEYS)
-                                ip.setString(1, prodName); ip.setString(2, newType); ip.setString(3, nm); ip.setInt(4, newRack.toIntOrNull() ?: 1); ip.setDouble(5, itemCost.toDoubleOrNull() ?: 0.0); ip.executeUpdate()
+                                val ip = sc.prepareStatement("INSERT INTO products (product_name, type, quantity, supplied_by, warranty, rack, cost_price, selling_price) VALUES (?, ?, 0, ?, '', ?, ?, ?)", java.sql.Statement.RETURN_GENERATED_KEYS)
+                                ip.setString(1, prodName); ip.setString(2, newType); ip.setString(3, nm); ip.setInt(4, newRack.toIntOrNull() ?: 1); ip.setDouble(5, itemCost.toDoubleOrNull() ?: 0.0); ip.setDouble(6, itemSell.toDoubleOrNull() ?: 0.0); ip.executeUpdate()
                                 val gk = ip.generatedKeys; gk.next(); val newId = gk.getInt(1)
                                 sc.close()
-                                lineItems.add(LineItem(newId, prodName, itemQty.toInt(), itemCost.toDouble()))
-                                prodList = prodList + ProductRow(newId, prodName, newType, 0, nm, "", newRack.toIntOrNull() ?: 1, itemCost.toDoubleOrNull() ?: 0.0, 0.0)
+                                lineItems.add(LineItem(newId, prodName, itemQty.toInt(), itemCost.toDouble(), itemSell.toDouble()))
+                                prodList = prodList + ProductRow(newId, prodName, newType, 0, nm, "", newRack.toIntOrNull() ?: 1, itemCost.toDoubleOrNull() ?: 0.0, itemSell.toDoubleOrNull() ?: 0.0)
                                 resetNewForm()
                             } catch (e: Exception) { msg = e.message ?: "Create failed" }
                         }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Green)) { Text("Create Product & Add Item", color = Color.White, fontSize = 13.sp) }
@@ -595,7 +872,7 @@ private fun AddSupplierReceiptDialog(refresh: () -> Unit, onClose: () -> Unit) {
                     if (lineItems.isNotEmpty()) {
                         Spacer(Modifier.height(8.dp)); Divider(color = Color.Gray, thickness = 1.dp); Spacer(Modifier.height(4.dp))
                         Text("Items (${lineItems.size}):", fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                        lineItems.forEach { li -> Text("${li.productName} x${li.qty} @ ₹${li.price} = ₹${li.qty * li.price}", fontSize = 12.sp) }
+                        lineItems.forEach { li -> Text("${li.productName} x${li.qty} @ ₹${li.price} (sell ₹${li.sellPrice}) = ₹${li.qty * li.price}", fontSize = 12.sp) }
                         Text("Receipt Total: ₹${lineItems.sumOf { it.qty * it.price }}", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = Color(0xFF2E7D32))
                     }
                 }
@@ -603,7 +880,7 @@ private fun AddSupplierReceiptDialog(refresh: () -> Unit, onClose: () -> Unit) {
         }
     }, confirmButton = {
         when (step) {
-            0 -> Button(onClick = {
+            0 -> Button(enabled = nm.isNotBlank(), onClick = {
                 if (nm.isBlank()) return@Button
                 try {
                     val c = DriverManager.getConnection("jdbc:mysql://localhost:3306/suppliers", DB_USER, DB_PASS)
@@ -613,13 +890,22 @@ private fun AddSupplierReceiptDialog(refresh: () -> Unit, onClose: () -> Unit) {
                     c.close()
                 } catch (e: Exception) { msg = e.message ?: "Error" }
             }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Dark)) { Text("Check", color = Color.White) }
-            1 -> Button(onClick = {
-                if (ph.isBlank()) return@Button
+            1 -> Button(enabled = isPhoneOk(ph) && newAddresses.isNotEmpty(), onClick = {
+                if (!isPhoneOk(ph) || newAddresses.isEmpty()) return@Button
                 try {
                     val c = DriverManager.getConnection("jdbc:mysql://localhost:3306/suppliers", DB_USER, DB_PASS)
-                    val p = c.prepareStatement("INSERT INTO supplier (name, phone) VALUES (?, ?)", java.sql.Statement.RETURN_GENERATED_KEYS)
-                    p.setString(1, nm); p.setString(2, ph); p.executeUpdate()
-                    val r = p.generatedKeys; r.next(); foundId = r.getInt(1); c.close(); step = 2
+                    c.autoCommit = false
+                    try {
+                        val p = c.prepareStatement("INSERT INTO supplier (name, phone) VALUES (?, ?)", java.sql.Statement.RETURN_GENERATED_KEYS)
+                        p.setString(1, nm); p.setString(2, ph); p.executeUpdate()
+                        val r = p.generatedKeys; r.next(); foundId = r.getInt(1)
+                        try {
+                            val pa = c.prepareStatement("INSERT INTO supplier_addresses (supplier_id, address) VALUES (?, ?)")
+                            newAddresses.forEach { a -> pa.setInt(1, foundId!!); pa.setString(2, a.trim()); pa.executeUpdate() }
+                        } catch (_: Exception) { }
+                        c.commit(); step = 2
+                    } catch (ex: Exception) { c.rollback(); msg = ex.message ?: "Error"; return@Button }
+                    finally { c.autoCommit = true; c.close() }
                 } catch (e: Exception) { msg = e.message ?: "Error" }
             }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Green)) { Text("Create & Continue", color = Color.White) }
             2 -> Button(enabled = lineItems.isNotEmpty(), onClick = {
@@ -631,10 +917,10 @@ private fun AddSupplierReceiptDialog(refresh: () -> Unit, onClose: () -> Unit) {
                         pr.setInt(1, foundId!!); pr.executeUpdate()
                         val rr = pr.generatedKeys; rr.next(); val receiptId = rr.getInt(1)
                         val pi = c.prepareStatement("INSERT INTO supplier_receipt_items (receipt_id, stock_id, quantity, cost_price) VALUES (?, ?, ?, ?)")
-                        val ps = c.prepareStatement("UPDATE stock.products SET quantity = quantity + ? WHERE id = ?")
+                        val ps = c.prepareStatement("UPDATE stock.products SET quantity = quantity + ?, selling_price = ? WHERE id = ?")
                         lineItems.forEach { li ->
                             pi.setInt(1, receiptId); pi.setInt(2, li.stockId); pi.setInt(3, li.qty); pi.setDouble(4, li.price); pi.executeUpdate()
-                            ps.setInt(1, li.qty); ps.setInt(2, li.stockId); ps.executeUpdate()
+                            ps.setInt(1, li.qty); ps.setDouble(2, li.sellPrice); ps.setInt(3, li.stockId); ps.executeUpdate()
                         }
                         c.commit(); refresh()
                     } catch (ex: Exception) { c.rollback(); msg = ex.message ?: "Transaction failed"; return@Button
@@ -703,19 +989,30 @@ fun productScreen(onBack: () -> Unit) {
         var productName by remember { mutableStateOf(p?.productName ?: "") }; var type by remember { mutableStateOf(p?.type ?: "") }; var qty by remember { mutableStateOf(p?.quantity?.toString() ?: "0") }
         var suppliedBy by remember { mutableStateOf(p?.suppliedBy ?: "") }; var warranty by remember { mutableStateOf(p?.warranty ?: "") }; var rack by remember { mutableStateOf(p?.rack?.toString() ?: "1") }
         var costPrice by remember { mutableStateOf(p?.costPrice?.toString() ?: "0") }; var sellingPrice by remember { mutableStateOf(p?.sellingPrice?.toString() ?: "0") }
+        val nameErr = if (productName.isBlank()) "Required" else null
+        val typeErr = if (type.isBlank()) "Required" else null
+        val qtyErr = if (qty.toIntOrNull() == null || qty.toInt() < 0) "Must be 0 or more" else null
+        val rackErr = if (rack.toIntOrNull() == null || rack.toInt() !in 1..30) "1-30" else null
+        val costErr = if (costPrice.toDoubleOrNull() == null || costPrice.toDouble() < 0) "Must be 0 or more" else null
+        val sellErr = if (sellingPrice.toDoubleOrNull() == null || sellingPrice.toDouble() < 0) "Must be 0 or more" else null
+        val productValid = nameErr == null && typeErr == null && qtyErr == null && rackErr == null && costErr == null && sellErr == null
         AlertDialog(onDismissRequest = { showAdd = false; editingProduct = null }, title = { Text(if (isEdit) "Edit Product" else "Add Product", fontFamily = girassol) }, text = {
             Column(Modifier.verticalScroll(rememberScrollState()).width(350.dp)) {
-                OutlinedTextField(value = productName, onValueChange = { productName = it }, label = { Text("Product Name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = productName, onValueChange = { productName = it }, label = { Text("Product Name") }, singleLine = true, modifier = Modifier.fillMaxWidth(), isError = nameErr != null)
+                FieldError(nameErr)
                 Spacer(Modifier.height(6.dp))
-                Row { OutlinedTextField(value = type, onValueChange = { type = it }, label = { Text("Type") }, singleLine = true, modifier = Modifier.weight(1f)); Spacer(Modifier.width(6.dp)); OutlinedTextField(value = qty, onValueChange = { qty = it }, label = { Text("Qty") }, singleLine = true, modifier = Modifier.weight(1f)) }
+                Row { OutlinedTextField(value = type, onValueChange = { type = it }, label = { Text("Type") }, singleLine = true, modifier = Modifier.weight(1f), isError = typeErr != null); Spacer(Modifier.width(6.dp)); OutlinedTextField(value = qty, onValueChange = { qty = it }, label = { Text("Qty") }, singleLine = true, modifier = Modifier.weight(1f), isError = qtyErr != null) }
+                Row { FieldError(typeErr); Spacer(Modifier.width(6.dp)); Spacer(Modifier.weight(1f)); FieldError(qtyErr); Spacer(Modifier.weight(1f)) }
                 Spacer(Modifier.height(6.dp)); OutlinedTextField(value = suppliedBy, onValueChange = { suppliedBy = it }, label = { Text("Supplied By") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 Spacer(Modifier.height(6.dp))
-                Row { OutlinedTextField(value = warranty, onValueChange = { warranty = it }, label = { Text("Warranty") }, singleLine = true, modifier = Modifier.weight(1f)); Spacer(Modifier.width(6.dp)); OutlinedTextField(value = rack, onValueChange = { rack = it }, label = { Text("Rack (1-30)") }, singleLine = true, modifier = Modifier.weight(1f)) }
+                Row { OutlinedTextField(value = warranty, onValueChange = { warranty = it }, label = { Text("Warranty") }, singleLine = true, modifier = Modifier.weight(1f)); Spacer(Modifier.width(6.dp)); OutlinedTextField(value = rack, onValueChange = { rack = it }, label = { Text("Rack (1-30)") }, singleLine = true, modifier = Modifier.weight(1f), isError = rackErr != null) }
+                FieldError(rackErr)
                 Spacer(Modifier.height(6.dp))
-                Row { OutlinedTextField(value = costPrice, onValueChange = { costPrice = it }, label = { Text("Cost Price") }, singleLine = true, modifier = Modifier.weight(1f)); Spacer(Modifier.width(6.dp)); OutlinedTextField(value = sellingPrice, onValueChange = { sellingPrice = it }, label = { Text("Sell Price") }, singleLine = true, modifier = Modifier.weight(1f)) }
+                Row { OutlinedTextField(value = costPrice, onValueChange = { costPrice = it }, label = { Text("Cost Price") }, singleLine = true, modifier = Modifier.weight(1f), isError = costErr != null); Spacer(Modifier.width(6.dp)); OutlinedTextField(value = sellingPrice, onValueChange = { sellingPrice = it }, label = { Text("Sell Price") }, singleLine = true, modifier = Modifier.weight(1f), isError = sellErr != null) }
+                Row { FieldError(costErr); Spacer(Modifier.width(6.dp)); Spacer(Modifier.weight(1f)); FieldError(sellErr); Spacer(Modifier.weight(1f)) }
             }
         }, confirmButton = {
-            Button(onClick = {
+            Button(enabled = productValid, onClick = {
                 try {
                     val c = DriverManager.getConnection("jdbc:mysql://localhost:3306/stock", DB_USER, DB_PASS)
                     if (isEdit) { val p2 = c.prepareStatement("UPDATE products SET product_name=?, type=?, quantity=?, supplied_by=?, warranty=?, rack=?, cost_price=?, selling_price=? WHERE id=?")
@@ -761,6 +1058,7 @@ fun insuranceScreen(onBack: () -> Unit) {
     var refresh by remember { mutableStateOf(0) }; var search by remember { mutableStateOf("") }
     var editingPolicy by remember { mutableStateOf<InsuranceRow?>(null) }; var showAdd by remember { mutableStateOf(false) }
     var deletingPolicy by remember { mutableStateOf<InsuranceRow?>(null) }; var errorMsg by remember { mutableStateOf("") }
+    var showExpired by remember { mutableStateOf(false) }
 
     val policies = remember(refresh) {
         val list = mutableListOf<InsuranceRow>()
@@ -773,25 +1071,50 @@ fun insuranceScreen(onBack: () -> Unit) {
         } catch (e: Exception) { errorMsg = e.message ?: "Error" }
         list
     }
-    val filtered = if (search.isBlank()) policies else policies.filter { it.customerName.contains(search, ignoreCase = true) || it.vehicleNumber.contains(search) || it.policyName.contains(search, ignoreCase = true) }
+    val expiredCount = policies.count { (daysUntilExpiry(it.expiryDate) ?: 999) < 0 }
+    val urgentCount = policies.count { (daysUntilExpiry(it.expiryDate) ?: 999) in 0..7 }
+    val baseList = if (showExpired) policies.filter { (daysUntilExpiry(it.expiryDate) ?: 999) < 0 }
+        else policies.filter { (daysUntilExpiry(it.expiryDate) ?: 999) >= 0 }
+    val filtered = if (search.isBlank()) baseList else baseList.filter { it.customerName.contains(search, ignoreCase = true) || it.vehicleNumber.contains(search) || it.policyName.contains(search, ignoreCase = true) }
 
     Box(Modifier.fillMaxSize().background(AppColors.Bg)) {
         Column(Modifier.fillMaxSize().padding(20.dp)) {
-            ScreenHeader("INSURANCE", onBack) { showAdd = true }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Button(onClick = onBack, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Dark), modifier = Modifier.size(44.dp)) { Text("←", color = Color.White, fontSize = 18.sp) }
+                Spacer(Modifier.width(12.dp)); Text(if (showExpired) "EXPIRED" else "INSURANCE", fontFamily = girassol, color = AppColors.Gold, fontSize = 28.sp, modifier = Modifier.weight(1f))
+                Button(onClick = { showExpired = !showExpired }, colors = ButtonDefaults.buttonColors(backgroundColor = if (showExpired) AppColors.Gold else AppColors.Card), shape = RoundedCornerShape(8.dp)) {
+                    Text("Expired ($expiredCount)", color = if (showExpired) AppColors.Bg else Color.White, fontWeight = FontWeight.Bold)
+                }
+                Spacer(Modifier.width(8.dp))
+                Button(onClick = { showAdd = true }, colors = ButtonDefaults.buttonColors(backgroundColor = AppColors.Gold), shape = RoundedCornerShape(8.dp)) { Text("+ Add", color = AppColors.Bg, fontWeight = FontWeight.Bold) }
+            }
             Spacer(Modifier.height(8.dp)); SearchBar(search, { search = it }, "Search by name, vehicle, or policy...")
             if (errorMsg.isNotBlank()) ErrorCard(errorMsg)
+            if (!showExpired) {
+                if (expiredCount > 0) ErrorCard("$expiredCount policies expired - see Expired tab")
+                else if (urgentCount > 0) {
+                    Spacer(Modifier.height(8.dp))
+                    Card(Modifier.fillMaxWidth(), backgroundColor = Color(0xFF5C4A1E), shape = RoundedCornerShape(8.dp)) {
+                        Text("$urgentCount policies expiring within 7 days", color = Color(0xFFFFD54F), modifier = Modifier.padding(12.dp))
+                    }
+                }
+            }
             Spacer(Modifier.height(8.dp))
             Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) { HeaderCell("Customer", 2f); HeaderCell("Vehicle", 1.5f); HeaderCell("Policy", 1.5f); HeaderCell("Coverage", 1f); HeaderCell("Expires", 1f); HeaderCell("Actions", 1.5f) }
             Divider(color = Color.Gray, thickness = 1.dp)
             Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(top = 6.dp)) {
+                if (filtered.isEmpty()) Text(if (showExpired) "No expired policies" else "No active policies", color = Color.Gray, fontSize = 13.sp, modifier = Modifier.padding(12.dp))
                 filtered.forEach { pol ->
+                    val days = daysUntilExpiry(pol.expiryDate)
+                    val isExp = (days ?: 999) < 0
+                    val isUrg = (days ?: 999) in 0..7
                     DataCard {
                         Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                             Text(pol.customerName, Modifier.weight(2f), color = Color.White, fontSize = 14.sp)
                             Text(pol.vehicleNumber, Modifier.weight(1.5f), color = Color.LightGray, fontSize = 13.sp)
                             Text(pol.policyName, Modifier.weight(1.5f), color = Color.White, fontSize = 13.sp)
                             Text("₹${pol.coverage}", Modifier.weight(1f), color = Color(0xFF7EC87E), fontSize = 13.sp)
-                            Text(pol.expiryDate.take(10), Modifier.weight(1f), color = Color(0xFFFF9966), fontSize = 13.sp)
+                            Text(pol.expiryDate.take(10), Modifier.weight(1f), color = if (isExp) Color(0xFFFF6B6B) else if (isUrg) Color(0xFFFFD54F) else Color(0xFFFF9966), fontSize = 13.sp, fontWeight = if (isExp || isUrg) FontWeight.Bold else FontWeight.Normal)
                             Row(Modifier.weight(1.5f), horizontalArrangement = Arrangement.End) {
                                 Btn("Edit", AppColors.Navy) { editingPolicy = pol }
                                 Spacer(Modifier.width(4.dp))
@@ -809,19 +1132,31 @@ fun insuranceScreen(onBack: () -> Unit) {
         var customerName by remember { mutableStateOf(p?.customerName ?: "") }; var vehicleNumber by remember { mutableStateOf(p?.vehicleNumber ?: "") }; var drivingLicense by remember { mutableStateOf(p?.drivingLicense ?: "") }
         var panNumber by remember { mutableStateOf(p?.panNumber ?: "") }; var rcNumber by remember { mutableStateOf(p?.rcNumber ?: "") }; var insuranceCompany by remember { mutableStateOf(p?.insuranceCompany ?: "") }
         var policyName by remember { mutableStateOf(p?.policyName ?: "") }; var coverage by remember { mutableStateOf(p?.coverage?.toString() ?: "0") }; var expiryDate by remember { mutableStateOf(p?.expiryDate?.take(10) ?: "") }
+        val nameErr = if (customerName.isBlank()) "Required" else null
+        val vehErr = if (vehicleNumber.trim().length < 4) "Min 4 chars" else null
+        val coErr = if (insuranceCompany.isBlank()) "Required" else null
+        val polErr = if (policyName.isBlank()) "Required" else null
+        val covErr = if (coverage.toDoubleOrNull() == null || coverage.toDouble() < 0) "Must be 0 or more" else null
+        val dateErr = if (!isDateOk(expiryDate)) "YYYY-MM-DD" else null
+        val panErr = if (!isPanOk(panNumber)) "Invalid PAN" else null
+        val insValid = nameErr == null && vehErr == null && coErr == null && polErr == null && covErr == null && dateErr == null && panErr == null
         AlertDialog(onDismissRequest = { showAdd = false; editingPolicy = null }, title = { Text(if (isEdit) "Edit Policy" else "Add Policy", fontFamily = girassol) }, text = {
             Column(Modifier.verticalScroll(rememberScrollState()).width(400.dp)) {
-                Row { OutlinedTextField(value = customerName, onValueChange = { customerName = it }, label = { Text("Customer Name") }, singleLine = true, modifier = Modifier.weight(1f)); Spacer(Modifier.width(6.dp)); OutlinedTextField(value = vehicleNumber, onValueChange = { vehicleNumber = it }, label = { Text("Vehicle No") }, singleLine = true, modifier = Modifier.weight(1f)) }
+                Row { OutlinedTextField(value = customerName, onValueChange = { customerName = it }, label = { Text("Customer Name") }, singleLine = true, modifier = Modifier.weight(1f), isError = nameErr != null); Spacer(Modifier.width(6.dp)); OutlinedTextField(value = vehicleNumber, onValueChange = { vehicleNumber = it }, label = { Text("Vehicle No") }, singleLine = true, modifier = Modifier.weight(1f), isError = vehErr != null) }
+                Row { FieldError(nameErr); Spacer(Modifier.weight(1f)); FieldError(vehErr); Spacer(Modifier.weight(1f)) }
                 Spacer(Modifier.height(6.dp))
-                Row { OutlinedTextField(value = drivingLicense, onValueChange = { drivingLicense = it }, label = { Text("DL No") }, singleLine = true, modifier = Modifier.weight(1f)); Spacer(Modifier.width(6.dp)); OutlinedTextField(value = panNumber, onValueChange = { panNumber = it }, label = { Text("PAN") }, singleLine = true, modifier = Modifier.weight(1f)) }
+                Row { OutlinedTextField(value = drivingLicense, onValueChange = { drivingLicense = it }, label = { Text("DL No") }, singleLine = true, modifier = Modifier.weight(1f)); Spacer(Modifier.width(6.dp)); OutlinedTextField(value = panNumber, onValueChange = { panNumber = it }, label = { Text("PAN") }, singleLine = true, modifier = Modifier.weight(1f), isError = panErr != null) }
+                Row { Spacer(Modifier.weight(1f)); FieldError(panErr); Spacer(Modifier.weight(0.5f)) }
                 Spacer(Modifier.height(6.dp)); OutlinedTextField(value = rcNumber, onValueChange = { rcNumber = it }, label = { Text("RC No") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 Spacer(Modifier.height(6.dp))
-                Row { OutlinedTextField(value = insuranceCompany, onValueChange = { insuranceCompany = it }, label = { Text("Insurance Co") }, singleLine = true, modifier = Modifier.weight(1f)); Spacer(Modifier.width(6.dp)); OutlinedTextField(value = policyName, onValueChange = { policyName = it }, label = { Text("Policy Name") }, singleLine = true, modifier = Modifier.weight(1f)) }
+                Row { OutlinedTextField(value = insuranceCompany, onValueChange = { insuranceCompany = it }, label = { Text("Insurance Co") }, singleLine = true, modifier = Modifier.weight(1f), isError = coErr != null); Spacer(Modifier.width(6.dp)); OutlinedTextField(value = policyName, onValueChange = { policyName = it }, label = { Text("Policy Name") }, singleLine = true, modifier = Modifier.weight(1f), isError = polErr != null) }
+                Row { FieldError(coErr); Spacer(Modifier.weight(1f)); FieldError(polErr); Spacer(Modifier.weight(1f)) }
                 Spacer(Modifier.height(6.dp))
-                Row { OutlinedTextField(value = coverage, onValueChange = { coverage = it }, label = { Text("Coverage ₹") }, singleLine = true, modifier = Modifier.weight(1f)); Spacer(Modifier.width(6.dp)); OutlinedTextField(value = expiryDate, onValueChange = { expiryDate = it }, label = { Text("Expiry (YYYY-MM-DD)") }, singleLine = true, modifier = Modifier.weight(1f)) }
+                Row { OutlinedTextField(value = coverage, onValueChange = { coverage = it }, label = { Text("Coverage ₹") }, singleLine = true, modifier = Modifier.weight(1f), isError = covErr != null); Spacer(Modifier.width(6.dp)); OutlinedTextField(value = expiryDate, onValueChange = { expiryDate = it }, label = { Text("Expiry (YYYY-MM-DD)") }, singleLine = true, modifier = Modifier.weight(1f), isError = dateErr != null) }
+                Row { FieldError(covErr); Spacer(Modifier.weight(1f)); FieldError(dateErr); Spacer(Modifier.weight(1f)) }
             }
         }, confirmButton = {
-            Button(onClick = {
+            Button(enabled = insValid, onClick = {
                 try {
                     val c = DriverManager.getConnection("jdbc:mysql://localhost:3306/insurance", DB_USER, DB_PASS)
                     if (isEdit) { val p2 = c.prepareStatement("UPDATE insurance SET customer_name=?, vehicle_number=?, driving_license=?, pan_number=?, rc_number=?, insurance_company=?, policy_name=?, coverage=?, expiry_date=? WHERE id=?")

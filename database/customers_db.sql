@@ -1,7 +1,5 @@
 -- ============================================================
--- customers_db.sql  —  Dump for `customers` database
--- Purpose: Stores shop customers, their bills and bill line items.
---          Used by CustomerScreen in Main.kt (JOINs at Main.kt:100)
+-- customers_db.sql  -  Dump for `customers` database
 -- Restore: mysql -u root -proot < database/customers_db.sql
 -- ============================================================
 
@@ -11,11 +9,9 @@ USE customers;
 
 SET FOREIGN_KEY_CHECKS = 0;
 
--- ----------------------------
--- Table: customer
--- ----------------------------
 DROP TABLE IF EXISTS bill_items;
 DROP TABLE IF EXISTS bills;
+DROP TABLE IF EXISTS customer_vehicles;
 DROP TABLE IF EXISTS customer;
 
 CREATE TABLE customer (
@@ -24,9 +20,14 @@ CREATE TABLE customer (
     phone VARCHAR(15) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- ----------------------------
--- Table: bills  (one bill per sale, linked to customer)
--- ----------------------------
+CREATE TABLE customer_vehicles (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    customer_id INT NOT NULL,
+    vehicle_number VARCHAR(20) NOT NULL,
+    FOREIGN KEY (customer_id) REFERENCES customer(id) ON DELETE CASCADE,
+    UNIQUE KEY uq_customer_vehicle (customer_id, vehicle_number)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE bills (
     bill_id INT AUTO_INCREMENT PRIMARY KEY,
     customer_id INT NOT NULL,
@@ -35,9 +36,6 @@ CREATE TABLE bills (
     FOREIGN KEY (customer_id) REFERENCES customer(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- ----------------------------
--- Table: bill_items  (line items inside a bill)
--- ----------------------------
 CREATE TABLE bill_items (
     id INT AUTO_INCREMENT PRIMARY KEY,
     bill_id INT NOT NULL,
@@ -49,17 +47,23 @@ CREATE TABLE bill_items (
 
 SET FOREIGN_KEY_CHECKS = 1;
 
--- ----------------------------
--- Seed Data  —  5 customers, 6 bills, 11 items
--- Item names match stock.products.product_name so stock deduction works
--- Prices are snapshots of stock.products.selling_price
--- ----------------------------
+-- Seed: 5 customers, 6 bills, 11 items + vehicles
 INSERT INTO customer (id, name, phone) VALUES
 (1, 'Amit Shah', '9876500001'),
 (2, 'Sunita Singh', '9876500002'),
 (3, 'Rohan Mehta', '9876500003'),
 (4, 'Priya Sharma', '9876500004'),
 (5, 'Vikram Patel', '9876500005');
+
+INSERT INTO customer_vehicles (id, customer_id, vehicle_number) VALUES
+(1, 1, 'MH-12-AB-1234'),
+(2, 1, 'MH-12-CD-5678'),
+(3, 2, 'DL-08-CA-4567'),
+(4, 3, 'GJ-01-RT-2345'),
+(5, 3, 'GJ-01-RT-9999'),
+(6, 3, 'GJ-05-MN-1111'),
+(7, 4, 'KA-05-MJ-6789'),
+(8, 5, 'TN-10-XY-2222');
 
 INSERT INTO bills (bill_id, customer_id, bill_date, paid) VALUES
 (1, 1, '2026-07-10 11:00:00', FALSE),
